@@ -47,8 +47,8 @@ import "../finance/AccountExtractor.sol";
  *   setAddressFrozen, freezePartialTokens, unfreezePartialTokens:
  *                          [adminPolicy(sender)]
  *
- * The factory owns the mint policies so it can authorize escrows (and CCIP
- * pools) as minters after deployment.
+ * The factory owns the mint policies so it can authorize escrows as minters
+ * after deployment.
  */
 contract PropertyFactory is Ownable {
 	struct ProductRecord {

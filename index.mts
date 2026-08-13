@@ -237,7 +237,6 @@ const ERC20_PERMIT_ABI = [
 	},
 ] as const;
 
-/** Contract ABIs (ethers/viem compatible). */
 /** Minimal ABI for the ACE IdentityRegistry (full ABI ships with @chainlink/ace). */
 const IDENTITY_REGISTRY_ABI = [
 	{
