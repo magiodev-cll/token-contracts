@@ -5,35 +5,36 @@ import { getNetwork } from "../networks";
 /**
  * Self-serve CCT registration for a PropertyToken + pool pair on the
  * connected network (https://docs.chain.link/ccip/concepts/cross-chain-token),
- * plus the token-side wiring a working lane requires:
- *   1. Grant the pool MINTER_ROLE + BURNER_ROLE on the bridged token
- *   2. Exempt the pool in TokenCompliance (the onRamp transfers user tokens
- *      to the pool before lockOrBurn; without exemption that transfer reverts)
+ * plus the token-side wiring a working ACE lane requires:
+ *   1. Authorize the pool as a minter on the product's mint policy
+ *      (OnlyAuthorizedSenderPolicy) — inbound bridge deliveries mint through it
+ *   2. Ensure the pool is on the token's transfer BypassPolicy (the onRamp
+ *      transfers user tokens to the pool before lockOrBurn; the pool is a
+ *      contract without credentials, so its receives are bypass-listed)
  *   3. RegistryModuleOwnerCustom.registerAdminViaGetCCIPAdmin(token)
  *   4. TokenAdminRegistry.acceptAdminRole(token)
  *   5. TokenAdminRegistry.setPool(token, pool)
  * Cross-chain lane wiring (applyChainUpdates) is a separate step once the
  * remote pool exists.
  *
- * The signer (EVM_PRIVATE_KEY) must be the token's CCIP admin (its owner) and
- * the TokenCompliance owner. Steps 1-2 are skipped with a warning if the token
- * is not a role-based bridged token or the signer lacks the rights.
+ * The signer (EVM_PRIVATE_KEY) must be the token's CCIP admin (its owner).
+ * Outbound burns are unrestricted self-burn (IBurnMintERC20.burn(uint256)),
+ * so no burn authorization is needed on the ACE token.
  *
  * Usage: hardhat run --network arc-testnet scripts/ccip-register.ts
  *   env: CCIP_TOKEN=0x...  CCIP_POOL=0x...
+ *        CCIP_MINT_POLICY=0x...   # product mint policy (optional)
+ *        CCIP_BYPASS_POLICY=0x... # transfer BypassPolicy (optional)
  */
 
 const CCIP_ADMIN_ABI = ["function getCCIPAdmin() view returns (address)"];
-const ACCESS_CONTROL_ABI = [
-	"function MINTER_ROLE() view returns (bytes32)",
-	"function BURNER_ROLE() view returns (bytes32)",
-	"function hasRole(bytes32 role, address account) view returns (bool)",
-	"function grantRole(bytes32 role, address account)",
+const SENDER_POLICY_ABI = [
+	"function senderAuthorized(address account) view returns (bool)",
+	"function authorizeSender(address account)",
 ];
-const COMPLIANCE_ABI = [
-	"function compliance() view returns (address)",
-	"function isExempt(address) view returns (bool)",
-	"function setExempt(address target, bool status)",
+const BYPASS_POLICY_ABI = [
+	"function addressAllowed(address account) view returns (bool)",
+	"function allowAddress(address account)",
 ];
 const REGISTRY_MODULE_ABI = [
 	"function registerAdminViaGetCCIPAdmin(address token) external",
@@ -44,7 +45,7 @@ const TOKEN_ADMIN_REGISTRY_ABI = [
 	"function getTokenConfig(address token) external view returns (tuple(address administrator, address pendingAdministrator, address tokenPool))",
 ];
 
-const { ethers, networkName } = await hre.network.connect();
+const { ethers, networkName } = await hre.network.getOrCreate();
 const [signer] = await ethers.getSigners();
 
 if (!process.env.CCIP_TOKEN || !process.env.CCIP_POOL) {
@@ -93,62 +94,48 @@ if (tokenAdmin !== signer.address) {
 	process.exit(1);
 }
 
-// Step 1: grant the pool MINTER_ROLE + BURNER_ROLE (bridged tokens only).
-// Only the pre-flight capability probe is allowed to swallow errors; an actual
-// grant transaction that reverts is a hard failure (a silent one ships a
-// broken lane).
-const ac = new ethers.Contract(token, ACCESS_CONTROL_ABI, signer);
-let minter: string | null = null;
-let burner: string | null = null;
-try {
-	minter = await ac.MINTER_ROLE();
-	burner = await ac.BURNER_ROLE();
-} catch {
-	console.warn(
-		chalk.yellow(
-			"Token exposes no MINTER_ROLE/BURNER_ROLE — not a bridged token. Skipping role grants (inbound minting will not work if it should be bridged)."
-		)
-	);
-}
-if (minter && burner) {
-	for (const [name, role] of [
-		["MINTER_ROLE", minter],
-		["BURNER_ROLE", burner],
-	] as const) {
-		if (await ac.hasRole(role, pool)) {
-			console.log(`${name}: already granted to pool.`);
-		} else {
-			console.log(`Granting ${name} to pool...`);
-			await (await ac.grantRole(role, pool)).wait();
-		}
-	}
-}
-
-// Step 2: exempt the pool in TokenCompliance so outbound transfers to it pass.
-// Reads are best-effort; a setExempt that reverts is a hard failure.
-const complianceReader = new ethers.Contract(token, COMPLIANCE_ABI, signer);
-let complianceAddr: string | null = null;
-try {
-	complianceAddr = ethers.getAddress(await complianceReader.compliance());
-} catch {
-	console.warn(
-		chalk.yellow(
-			"Token exposes no compliance() — cannot auto-exempt the pool. Ensure the pool is exempt in TokenCompliance manually, or outbound bridging will revert."
-		)
-	);
-}
-if (complianceAddr) {
-	const compliance = new ethers.Contract(
-		complianceAddr,
-		COMPLIANCE_ABI,
+// Step 1: authorize the pool as a minter on the product's mint policy.
+if (process.env.CCIP_MINT_POLICY) {
+	const mintPolicy = new ethers.Contract(
+		ethers.getAddress(process.env.CCIP_MINT_POLICY),
+		SENDER_POLICY_ABI,
 		signer
 	);
-	if (await compliance.isExempt(pool)) {
-		console.log("Compliance exemption: pool already exempt.");
+	if (await mintPolicy.senderAuthorized(pool)) {
+		console.log("Mint policy: pool already authorized.");
 	} else {
-		console.log("Exempting pool in TokenCompliance...");
-		await (await compliance.setExempt(pool, true)).wait();
+		console.log("Authorizing the pool as a minter...");
+		await (await mintPolicy.authorizeSender(pool)).wait();
 	}
+} else {
+	console.warn(
+		chalk.yellow(
+			"CCIP_MINT_POLICY not set — skipped. The pool must be authorized on the product's mint policy or inbound bridge mints will revert."
+		)
+	);
+}
+
+// Step 2: ensure the pool is on the token's transfer BypassPolicy so holders
+// can fund it (the pool is a contract without credentials; its receives are
+// bypass-listed, see test/CCIPCompliantPool.ts for the wiring pattern).
+if (process.env.CCIP_BYPASS_POLICY) {
+	const bypass = new ethers.Contract(
+		ethers.getAddress(process.env.CCIP_BYPASS_POLICY),
+		BYPASS_POLICY_ABI,
+		signer
+	);
+	if (await bypass.addressAllowed(pool)) {
+		console.log("Bypass policy: pool already allowed.");
+	} else {
+		console.log("Allowing the pool on the transfer bypass policy...");
+		await (await bypass.allowAddress(pool)).wait();
+	}
+} else {
+	console.warn(
+		chalk.yellow(
+			"CCIP_BYPASS_POLICY not set — skipped. Ensure the pool is on the token's transfer BypassPolicy or outbound transfers to it will revert."
+		)
+	);
 }
 
 // Steps 3-5: CCT admin registration + pool link.
