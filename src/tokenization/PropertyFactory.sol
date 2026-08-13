@@ -18,6 +18,7 @@ import {Policy} from "@chainlink/policy-management/core/Policy.sol";
 import {
 	OnlyAuthorizedSenderPolicy
 } from "@chainlink/policy-management/policies/OnlyAuthorizedSenderPolicy.sol";
+import {RejectPolicy} from "@chainlink/policy-management/policies/RejectPolicy.sol";
 import {
 	CredentialRegistryIdentityValidatorPolicy
 } from "@chainlink/cross-chain-identity/CredentialRegistryIdentityValidatorPolicy.sol";
@@ -30,7 +31,7 @@ import {
 
 import "./PropertyToken.sol";
 import "../finance/ListingEscrow.sol";
-import "../policies/SanctionsPolicy.sol";
+import "../finance/AccountExtractor.sol";
 
 /**
  * @title PropertyFactory
@@ -40,7 +41,7 @@ import "../policies/SanctionsPolicy.sol";
  * @dev This replaces the previous factory, which deployed bespoke tokens with a
  * hardcoded `TokenCompliance`. Compliance is now the ACE policy graph:
  *
- * - transfer/transferFrom: [eligibility(from,to), sanctions(to)]
+ * - transfer/transferFrom: [eligibility(from,to), reject(to)]
  * - mint:                 [mintPolicy(sender), eligibility(account)]
  * - burn, pause, unpause, setName, setSymbol, forcedTransfer,
  *   setAddressFrozen, freezePartialTokens, unfreezePartialTokens:
@@ -61,10 +62,11 @@ contract PropertyFactory is Ownable {
 	PolicyEngine public immutable policyEngine;
 	address public immutable identityRegistry;
 	address public immutable credentialRegistry;
-	address public immutable sanctionsPolicy;
+	address public immutable rejectPolicy;
 	address public immutable tokenImplementation;
 	address public immutable eligibilityPolicyImplementation;
 	address public immutable senderPolicyImplementation;
+	address public immutable accountExtractor;
 
 	uint256 public nextProductId = 1;
 
@@ -90,7 +92,7 @@ contract PropertyFactory is Ownable {
 	constructor(
 		address initialOwner,
 		address policyEngine_,
-		address sanctionsPolicy_,
+		address rejectPolicy_,
 		address tokenImplementation_,
 		address eligibilityPolicyImplementation_,
 		address senderPolicyImplementation_
@@ -98,10 +100,11 @@ contract PropertyFactory is Ownable {
 		if (policyEngine_ == address(0)) revert InvalidAddress();
 
 		policyEngine = PolicyEngine(policyEngine_);
-		sanctionsPolicy = sanctionsPolicy_;
+		rejectPolicy = rejectPolicy_;
 		tokenImplementation = tokenImplementation_;
 		eligibilityPolicyImplementation = eligibilityPolicyImplementation_;
 		senderPolicyImplementation = senderPolicyImplementation_;
+		accountExtractor = address(new AccountExtractor());
 	}
 
 	/**
@@ -154,7 +157,7 @@ contract PropertyFactory is Ownable {
 
 		ListingEscrow escrow = new ListingEscrow(
 			product.token,
-			product.eligibilityPolicy,
+			address(policyEngine),
 			paymentToken,
 			sponsor,
 			targetRaise,
@@ -163,6 +166,25 @@ contract PropertyFactory is Ownable {
 			admin
 		);
 		address escrowAddress = address(escrow);
+
+		// Deposit selectors carry the investor as calldata/sender, so they
+		// need the escrow extractor and the product's eligibility + reject
+		// policies attached through the engine (the escrow itself holds no
+		// compliance logic — `runPolicy` gates deposit/depositFor).
+		policyEngine.setExtractor(ListingEscrow.deposit.selector, accountExtractor);
+		policyEngine.setExtractor(ListingEscrow.depositFor.selector, accountExtractor);
+
+		bytes32[] memory fromParam = new bytes32[](1);
+		fromParam[0] = keccak256("from");
+		bytes32[] memory accountParam = new bytes32[](1);
+		accountParam[0] = keccak256("account");
+
+		policyEngine.addPolicy(escrowAddress, ListingEscrow.deposit.selector, product.eligibilityPolicy, fromParam);
+		policyEngine.addPolicy(escrowAddress, ListingEscrow.deposit.selector, rejectPolicy, fromParam);
+		policyEngine.addPolicy(
+			escrowAddress, ListingEscrow.depositFor.selector, product.eligibilityPolicy, accountParam
+		);
+		policyEngine.addPolicy(escrowAddress, ListingEscrow.depositFor.selector, rejectPolicy, accountParam);
 
 		// The escrow mints shares to investors at finalize.
 		OnlyAuthorizedSenderPolicy(product.mintPolicy).authorizeSender(escrowAddress);
@@ -290,12 +312,12 @@ contract PropertyFactory is Ownable {
 		policyEngine.addPolicy(
 			token, ComplianceTokenERC3643.transfer.selector, eligibilityPolicy, transferParams
 		);
-		policyEngine.addPolicy(token, ComplianceTokenERC3643.transfer.selector, sanctionsPolicy, toParam);
+		policyEngine.addPolicy(token, ComplianceTokenERC3643.transfer.selector, rejectPolicy, toParam);
 		policyEngine.addPolicy(
 			token, ComplianceTokenERC3643.transferFrom.selector, eligibilityPolicy, transferParams
 		);
 		policyEngine.addPolicy(
-			token, ComplianceTokenERC3643.transferFrom.selector, sanctionsPolicy, toParam
+			token, ComplianceTokenERC3643.transferFrom.selector, rejectPolicy, toParam
 		);
 
 		policyEngine.addPolicy(token, ComplianceTokenERC3643.mint.selector, mintPolicy, emptyParams);

@@ -76,8 +76,7 @@ export interface AceCore {
 	identityRegistry: any;
 	credentialRegistry: any;
 	writerPolicy: any;
-	sanctionsList: any;
-	sanctionsPolicy: any;
+	rejectPolicy: any;
 	factory: any;
 }
 
@@ -144,24 +143,13 @@ export async function deployAceCore(admin: any): Promise<AceCore> {
 		await engine.addPolicy(target, sel(sig), writerPolicy.target, emptyParams);
 	}
 
-	// Sanctions: list owned by the admin (a sanctions provider would own it
-	// independently); shared policy referenced by every product.
-	const SanctionsList = await aceFactory("SanctionsList");
-	const sanctionsList = await SanctionsList.deploy();
-	await sanctionsList.waitForDeployment();
-
-	const SanctionsPolicy = await aceFactory("SanctionsPolicy");
-	const sanctionsPolicy = await deployProxy(
-		await SanctionsPolicy.deploy(),
-		SanctionsPolicy.interface.encodeFunctionData(
-			"initialize",
-			[
-				engine.target,
-				admin.address,
-				ethers.AbiCoder.defaultAbiCoder().encode(["address"], [sanctionsList.target]),
-			]
-		),
-		"SanctionsPolicy"
+	// Sanctions screening: stock RejectPolicy (denylist managed by its owner,
+	// the admin in this PoC — a sanctions provider would hold ownership).
+	const RejectPolicy = await aceFactory("RejectPolicy");
+	const rejectPolicy = await deployProxy(
+		await RejectPolicy.deploy(),
+		RejectPolicy.interface.encodeFunctionData("initialize", [engine.target, admin.address, "0x"]),
+		"RejectPolicy"
 	);
 
 	// Implementations are deployed once and shared by every product proxy.
@@ -181,7 +169,7 @@ export async function deployAceCore(admin: any): Promise<AceCore> {
 	const factory = await PropertyFactory.deploy(
 		admin.address,
 		engine.target,
-		sanctionsPolicy.target,
+		rejectPolicy.target,
 		tokenImplementation.target,
 		eligibilityImplementation.target,
 		senderPolicyImplementation.target
@@ -194,8 +182,7 @@ export async function deployAceCore(admin: any): Promise<AceCore> {
 		identityRegistry,
 		credentialRegistry,
 		writerPolicy,
-		sanctionsList,
-		sanctionsPolicy,
+		rejectPolicy,
 		factory,
 	};
 }

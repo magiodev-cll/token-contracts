@@ -11,6 +11,7 @@ describe("Commertize ACE Contracts Suite", function () {
 	let sponsor: any;
 	let core: any;
 	let propertyToken: any;
+	let escrow: any;
 
 	before(async function () {
 		[admin, agent, user, sponsor] = await ethers.getSigners();
@@ -97,9 +98,43 @@ describe("Commertize ACE Contracts Suite", function () {
 				return false;
 			}
 		});
-		const escrowAddress = core.factory.interface.parseLog(event!)!.args.escrow;
+		escrow = core.factory.interface.parseLog(event!)!.args.escrow;
 
-		expect(escrowAddress).to.not.equal(ethers.ZeroAddress);
-		expect(await core.factory.isEscrow(escrowAddress)).to.equal(true);
+		expect(escrow).to.not.equal(ethers.ZeroAddress);
+		expect(await core.factory.isEscrow(escrow)).to.equal(true);
+	});
+
+	it("RejectPolicy blocks transfers to a sanctioned address", async function () {
+		// the reject policy screens the recipient ("to" param), same as the
+		// previous SanctionsPolicy behavior
+		await core.rejectPolicy.connect(admin).rejectAddress(admin.address);
+		await expect(
+			propertyToken.connect(user).transfer(admin.address, 1n)
+		).to.be.revertedWithCustomError(core.engine, "PolicyRunRejected");
+
+		await core.rejectPolicy.connect(admin).unrejectAddress(admin.address);
+		await propertyToken.connect(user).transfer(admin.address, 1n);
+		expect(await propertyToken.balanceOf(admin.address)).to.equal(1n);
+	});
+
+	it("Escrow deposits are gated by the engine (eligibility + reject)", async function () {
+		const Escrow = await ethers.getContractFactory("ListingEscrow");
+		const escrowC = Escrow.attach(escrow);
+
+		// an un-onboarded investor cannot deposit
+		await expect(
+			escrowC.connect(agent).deposit(0n, { value: 2000n })
+		).to.be.revertedWithCustomError(core.engine, "PolicyRunRejected");
+
+		// a rejected investor cannot deposit either
+		await core.rejectPolicy.connect(admin).rejectAddress(user.address);
+		await expect(
+			escrowC.connect(user).deposit(0n, { value: 2000n })
+		).to.be.revertedWithCustomError(core.engine, "PolicyRunRejected");
+		await core.rejectPolicy.connect(admin).unrejectAddress(user.address);
+
+		// an eligible investor can
+		await escrowC.connect(user).deposit(0n, { value: 2000n });
+		expect(await escrowC.totalRaised()).to.equal(2000n);
 	});
 });
