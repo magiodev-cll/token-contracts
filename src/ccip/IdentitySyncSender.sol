@@ -1,3 +1,13 @@
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │  UNREVIEWED PROOF OF CONCEPT -- DO NOT USE IN PRODUCTION.                 │
+// │                                                                           │
+// │  THIS CODE HAS NOT BEEN AUDITED AND HAS NOT BEEN REVIEWED FOR SECURITY.   │
+// │  IT IS DEPLOYED ON A TEST NETWORK FOR INTEGRATION TESTING AND DEVELOPMENT │
+// │  PURPOSES ONLY. IT IS NOT SUITABLE FOR PRODUCTION USE, AND IT MUST NOT BE │
+// │  USED TO HOLD OR MOVE ANY ASSET OF VALUE.                                 │
+// │                                                                           │
+// │  PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. USE AT YOUR OWN RISK.    │
+// └───────────────────────────────────────────────────────────────────────────┘
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
@@ -12,11 +22,12 @@ import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet
 
 /**
  * @title IdentitySyncSender
- * @dev Home-chain endpoint that broadcasts identity registrations/removals to
- * every configured destination chain via CCIP, so each chain's IdentityRegistry
- * (through its IdentitySyncReceiver + SYNC_ROLE) mirrors global KYC state. This
- * is what makes source-side bridge gating sound: a receiver verified anywhere is
- * verified everywhere.
+ * @dev Home-chain endpoint that broadcasts identity and credential changes to
+ * every configured destination chain via CCIP, so each chain's ACE
+ * IdentityRegistry/CredentialRegistry (through its IdentitySyncReceiver,
+ * authorized as a writer by the destination's registry writer policy) mirrors
+ * global KYC state. This is what makes source-side bridge gating sound: a
+ * receiver eligible anywhere is eligible everywhere.
  *
  * Fees are paid in `feeToken` (address(0) = native). For native, the caller
  * sends msg.value covering the sum of per-destination fees (exact amounts are
@@ -30,149 +41,159 @@ import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet
  * a no-op instead of a de-authorization bypass.
  */
 contract IdentitySyncSender is Ownable, ReentrancyGuard {
-    using SafeERC20 for IERC20;
-    using EnumerableSet for EnumerableSet.UintSet;
+	using SafeERC20 for IERC20;
+	using EnumerableSet for EnumerableSet.UintSet;
 
-    IRouterClient public immutable router;
-    address public immutable feeToken; // address(0) => native
+	IRouterClient public immutable router;
+	address public immutable feeToken; // address(0) => native
 
-    // destinationChainSelector => IdentitySyncReceiver address
-    mapping(uint64 => address) public destReceiver;
-    EnumerableSet.UintSet private _destChains;
+	// destinationChainSelector => IdentitySyncReceiver address
+	mapping(uint64 => address) public destReceiver;
+	EnumerableSet.UintSet private _destChains;
 
-    // Per-user monotonic sequence number, embedded in every sync payload.
-    mapping(address => uint64) public userSeq;
+	// Per-user monotonic sequence number, embedded in every sync payload.
+	mapping(address => uint64) public userSeq;
 
-    uint256 public gasLimit = 200_000;
+	uint256 public gasLimit = 200_000;
 
-    /// @notice Upper bound on the fee accepted per destination message; caps
-    /// how much a single misconfigured/malicious lane router can pull (0 = no
-    /// cap). Symmetric across native and ERC20 fee paths.
-    uint256 public maxFeePerMessage;
+	/// @notice Upper bound on the fee accepted per destination message; caps
+	/// how much a single misconfigured/malicious lane router can pull (0 = no
+	/// cap). Symmetric across native and ERC20 fee paths.
+	uint256 public maxFeePerMessage;
 
-    event DestinationSet(uint64 indexed chainSelector, address receiver);
-    event GasLimitSet(uint256 gasLimit);
-    event MaxFeePerMessageSet(uint256 maxFee);
-    event IdentityBroadcast(
-        address indexed user,
-        bool removal,
-        uint64 indexed chainSelector,
-        bytes32 messageId
-    );
+	event DestinationSet(uint64 indexed chainSelector, address receiver);
+	event GasLimitSet(uint256 gasLimit);
+	event MaxFeePerMessageSet(uint256 maxFee);
+	event IdentityBroadcast(
+		address indexed user,
+		bool removal,
+		uint64 indexed chainSelector,
+		bytes32 messageId
+	);
 
-    error NoDestinations();
-    error InsufficientNativeFee(uint256 required, uint256 provided);
-    error FeeExceedsMax(uint64 chainSelector, uint256 fee, uint256 maxFee);
+	error NoDestinations();
+	error InsufficientNativeFee(uint256 required, uint256 provided);
+	error FeeExceedsMax(uint64 chainSelector, uint256 fee, uint256 maxFee);
 
-    constructor(
-        address _router,
-        address _feeToken,
-        address _owner
-    ) Ownable(_owner) {
-        router = IRouterClient(_router);
-        feeToken = _feeToken;
-    }
+	constructor(
+		address _router,
+		address _feeToken,
+		address _owner
+	) Ownable(_owner) {
+		router = IRouterClient(_router);
+		feeToken = _feeToken;
+	}
 
-    function setDestination(
-        uint64 chainSelector,
-        address receiver
-    ) external onlyOwner {
-        if (receiver != address(0)) {
-            _destChains.add(chainSelector);
-        } else {
-            _destChains.remove(chainSelector);
-        }
-        destReceiver[chainSelector] = receiver;
-        emit DestinationSet(chainSelector, receiver);
-    }
+	function setDestination(
+		uint64 chainSelector,
+		address receiver
+	) external onlyOwner {
+		if (receiver != address(0)) {
+			_destChains.add(chainSelector);
+		} else {
+			_destChains.remove(chainSelector);
+		}
+		destReceiver[chainSelector] = receiver;
+		emit DestinationSet(chainSelector, receiver);
+	}
 
-    function setGasLimit(uint256 _gasLimit) external onlyOwner {
-        gasLimit = _gasLimit;
-        emit GasLimitSet(_gasLimit);
-    }
+	function setGasLimit(uint256 _gasLimit) external onlyOwner {
+		gasLimit = _gasLimit;
+		emit GasLimitSet(_gasLimit);
+	}
 
-    function setMaxFeePerMessage(uint256 _maxFee) external onlyOwner {
-        maxFeePerMessage = _maxFee;
-        emit MaxFeePerMessageSet(_maxFee);
-    }
+	function setMaxFeePerMessage(uint256 _maxFee) external onlyOwner {
+		maxFeePerMessage = _maxFee;
+		emit MaxFeePerMessageSet(_maxFee);
+	}
 
-    function destinationCount() external view returns (uint256) {
-        return _destChains.length();
-    }
+	function destinationCount() external view returns (uint256) {
+		return _destChains.length();
+	}
 
-    function destChainAt(uint256 index) external view returns (uint64) {
-        return uint64(_destChains.at(index));
-    }
+	function destChainAt(uint256 index) external view returns (uint64) {
+		return uint64(_destChains.at(index));
+	}
 
-    function broadcastRegister(
-        address user,
-        uint16 country,
-        bytes32 identityHash
-    ) external payable onlyOwner nonReentrant {
-        uint64 seq = ++userSeq[user];
-        _broadcast(
-            abi.encode(false, user, country, identityHash, seq),
-            user,
-            false
-        );
-    }
+	/// @notice Broadcasts a wallet -> CCID registration to all destinations.
+	function broadcastRegister(
+		address user,
+		bytes32 ccid
+	) external payable onlyOwner nonReentrant {
+		uint64 seq = ++userSeq[user];
+		_broadcast(abi.encode(false, user, ccid, bytes32(0), false, uint40(0), seq), user, false);
+	}
 
-    function broadcastRemove(address user) external payable onlyOwner nonReentrant {
-        uint64 seq = ++userSeq[user];
-        _broadcast(abi.encode(true, user, uint16(0), bytes32(0), seq), user, true);
-    }
+	/// @notice Broadcasts an identity removal to all destinations.
+	function broadcastRemove(address user) external payable onlyOwner nonReentrant {
+		uint64 seq = ++userSeq[user];
+		_broadcast(abi.encode(true, user, bytes32(0), bytes32(0), false, uint40(0), seq), user, true);
+	}
 
-    function _broadcast(
-        bytes memory data,
-        address user,
-        bool removal
-    ) internal {
-        uint256 len = _destChains.length();
-        if (len == 0) revert NoDestinations();
+	/// @notice Broadcasts a credential enable/renew/remove (with expiry) to all
+	/// destinations. The CCID is resolved by the receiver from the local
+	/// IdentityRegistry, so the identity must already be synced.
+	function broadcastCredential(
+		address user,
+		bytes32 credentialType,
+		bool enabled,
+		uint40 expiresAt
+	) external payable onlyOwner nonReentrant {
+		uint64 seq = ++userSeq[user];
+		_broadcast(abi.encode(false, user, bytes32(0), credentialType, enabled, expiresAt, seq), user, false);
+	}
 
-        uint256 nativeSpent = 0;
-        for (uint256 i = 0; i < len; i++) {
-            uint64 sel = uint64(_destChains.at(i));
-            address receiver = destReceiver[sel];
+	function _broadcast(
+		bytes memory data,
+		address user,
+		bool removal
+	) internal {
+		uint256 len = _destChains.length();
+		if (len == 0) revert NoDestinations();
 
-            Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
-                receiver: abi.encode(receiver),
-                data: data,
-                tokenAmounts: new Client.EVMTokenAmount[](0),
-                feeToken: feeToken,
-                // Out-of-order execution: ordering is enforced by the per-user
-                // seq in the payload, so a stuck message must not head-of-line
-                // block later (possibly more urgent) removes.
-                extraArgs: Client._argsToBytes(
-                    Client.GenericExtraArgsV2({
-                        gasLimit: gasLimit,
-                        allowOutOfOrderExecution: true
-                    })
-                )
-            });
+		uint256 nativeSpent = 0;
+		for (uint256 i = 0; i < len; i++) {
+			uint64 sel = uint64(_destChains.at(i));
+			address receiver = destReceiver[sel];
 
-            uint256 fee = router.getFee(sel, message);
-            if (maxFeePerMessage != 0 && fee > maxFeePerMessage) {
-                revert FeeExceedsMax(sel, fee, maxFeePerMessage);
-            }
-            bytes32 messageId;
-            if (feeToken == address(0)) {
-                nativeSpent += fee;
-                if (msg.value < nativeSpent) {
-                    revert InsufficientNativeFee(nativeSpent, msg.value);
-                }
-                messageId = router.ccipSend{value: fee}(sel, message);
-            } else {
-                IERC20(feeToken).safeTransferFrom(msg.sender, address(this), fee);
-                IERC20(feeToken).forceApprove(address(router), fee);
-                messageId = router.ccipSend(sel, message);
-            }
-            emit IdentityBroadcast(user, removal, sel, messageId);
-        }
+			Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
+				receiver: abi.encode(receiver),
+				data: data,
+				tokenAmounts: new Client.EVMTokenAmount[](0),
+				feeToken: feeToken,
+				// Out-of-order execution: ordering is enforced by the per-user
+				// seq in the payload, so a stuck message must not head-of-line
+				// block later (possibly more urgent) removes.
+				extraArgs: Client._argsToBytes(
+					Client.GenericExtraArgsV2({
+						gasLimit: gasLimit,
+						allowOutOfOrderExecution: true
+					})
+				)
+			});
 
-        // Refund any native surplus.
-        if (feeToken == address(0) && msg.value > nativeSpent) {
-            Address.sendValue(payable(msg.sender), msg.value - nativeSpent);
-        }
-    }
+			uint256 fee = router.getFee(sel, message);
+			if (maxFeePerMessage != 0 && fee > maxFeePerMessage) {
+				revert FeeExceedsMax(sel, fee, maxFeePerMessage);
+			}
+			bytes32 messageId;
+			if (feeToken == address(0)) {
+				nativeSpent += fee;
+				if (msg.value < nativeSpent) {
+					revert InsufficientNativeFee(nativeSpent, msg.value);
+				}
+				messageId = router.ccipSend{value: fee}(sel, message);
+			} else {
+				IERC20(feeToken).safeTransferFrom(msg.sender, address(this), fee);
+				IERC20(feeToken).forceApprove(address(router), fee);
+				messageId = router.ccipSend(sel, message);
+			}
+			emit IdentityBroadcast(user, removal, sel, messageId);
+		}
+
+		// Refund any native surplus.
+		if (feeToken == address(0) && msg.value > nativeSpent) {
+			Address.sendValue(payable(msg.sender), msg.value - nativeSpent);
+		}
+	}
 }
