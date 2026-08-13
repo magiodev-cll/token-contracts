@@ -18,7 +18,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
-import {IIdentityValidator} from "@chainlink/cross-chain-identity/interfaces/IIdentityValidator.sol";
+import {PolicyProtected} from "@chainlink/policy-management/core/PolicyProtected.sol";
 import {
 	ComplianceTokenERC3643
 } from "@chainlink/ace/packages/tokens/erc-3643/src/ComplianceTokenERC3643.sol";
@@ -28,11 +28,12 @@ import {
  * @notice Holds Property Tokens and Investor Funds until a funding goal is met.
  * @dev Same flow as before, with the compliance layer moved to ACE:
  *
- * 1. `_checkCompliance()` no longer reads the bespoke `TokenCompliance` /
- *    `IdentityRegistry` (removed). It calls the product's ACE eligibility
- *    policy (`IIdentityValidator.validate`) — the same policy the token
- *    enforces on mint/transfer, so the escrow pre-check and the token's
- *    runtime check can never diverge.
+ * 1. `deposit`/`depositFor` are policy-protected (`runPolicy`): the escrow
+ *    inherits ACE `PolicyProtected` and the product's eligibility and reject
+ *    policies are attached to its deposit selectors by the factory, so the
+ *    engine itself gates who can invest — the same policies the token
+ *    enforces on mint/transfer. No separate compliance check exists in the
+ *    escrow contract.
  *
  * 2. Distribution at finalize mints tokens to investors instead of
  *    transferring a pre-funded escrow balance. The escrow is authorized as a
@@ -48,7 +49,7 @@ import {
  * The escrow must be authorized on the product's mint policy before
  * finalize() (PropertyFactory.deployEscrow does this).
  */
-contract ListingEscrow is Ownable, ReentrancyGuard, Pausable {
+contract ListingEscrow is PolicyProtected, ReentrancyGuard, Pausable {
 	using SafeERC20 for IERC20;
 	using EnumerableSet for EnumerableSet.AddressSet;
 
@@ -57,7 +58,6 @@ contract ListingEscrow is Ownable, ReentrancyGuard, Pausable {
 
 	// Configuration
 	ComplianceTokenERC3643 public propertyToken;
-	address public eligibilityPolicy; // ACE IIdentityValidator (product eligibility)
 	IERC20 public paymentToken; // If address(0), uses Native Token
 	address public sponsor;
 	uint256 public targetRaise;
@@ -116,16 +116,15 @@ contract ListingEscrow is Ownable, ReentrancyGuard, Pausable {
 
 	constructor(
 		address _propertyToken,
-		address _eligibilityPolicy,
+		address _policyEngine,
 		address _paymentToken,
 		address _sponsor,
 		uint256 _targetRaise,
 		uint256 _tokenSupply,
 		uint256 _deadline,
 		address _admin
-	) Ownable(_admin) {
+	) PolicyProtected(_admin, _policyEngine) {
 		require(_propertyToken != address(0), "Invalid property token");
-		require(_eligibilityPolicy != address(0), "Invalid eligibility policy");
 		require(_sponsor != address(0), "Invalid sponsor");
 		require(_targetRaise > 0, "Invalid target raise");
 		require(_deadline > block.timestamp, "Invalid deadline");
@@ -133,7 +132,6 @@ contract ListingEscrow is Ownable, ReentrancyGuard, Pausable {
 		// Note: _paymentToken can be address(0) for native token
 
 		propertyToken = ComplianceTokenERC3643(_propertyToken);
-		eligibilityPolicy = _eligibilityPolicy;
 		paymentToken = IERC20(_paymentToken);
 		sponsor = _sponsor;
 		targetRaise = _targetRaise;
@@ -151,22 +149,12 @@ contract ListingEscrow is Ownable, ReentrancyGuard, Pausable {
 	}
 
 	/**
-	 * @dev Verify investor passes the product's ACE eligibility policy.
-	 */
-	function _checkCompliance(address investor) internal view {
-		require(IIdentityValidator(eligibilityPolicy).validate(investor, ""), "Investor not eligible");
-	}
-
-	/**
 	 * @notice Invest in the listing.
 	 * @param amount Amount of payment tokens (ignored if Native).
 	 */
-	function deposit(uint256 amount) public payable nonReentrant whenNotPaused {
+	function deposit(uint256 amount) public payable runPolicy nonReentrant whenNotPaused {
 		require(!finalized && !refunded, "Escrow closed");
 		require(block.timestamp < deadline, "Deadline passed");
-
-		// Compliance Check
-		_checkCompliance(msg.sender);
 
 		uint256 depositAmount;
 
@@ -199,7 +187,7 @@ contract ListingEscrow is Ownable, ReentrancyGuard, Pausable {
 	function depositFor(
 		address investor,
 		uint256 amount
-	) external nonReentrant whenNotPaused {
+	) external runPolicy nonReentrant whenNotPaused {
 		require(!finalized && !refunded, "Escrow closed");
 		require(block.timestamp < deadline, "Deadline passed");
 		require(amount >= MIN_DEPOSIT, "Below minimum deposit");
@@ -211,9 +199,6 @@ contract ListingEscrow is Ownable, ReentrancyGuard, Pausable {
 
 		// Enforce Hard Cap
 		require(totalRaised + amount <= targetRaise, "Exceeds target raise");
-
-		// Compliance Check
-		_checkCompliance(investor);
 
 		// Pull funds from Investor (Investor must have approved Escrow)
 		paymentToken.safeTransferFrom(investor, address(this), amount);
