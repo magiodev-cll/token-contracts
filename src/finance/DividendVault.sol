@@ -7,7 +7,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "../tokenization/PropertyToken.sol";
-import "../compliance/TokenCompliance.sol";
+import {IIdentityValidator} from "@chainlink/cross-chain-identity/interfaces/IIdentityValidator.sol";
 
 /**
  * @title DividendVault
@@ -46,11 +46,16 @@ contract DividendVault is Ownable, ReentrancyGuard, Pausable {
     // Track valid property tokens
     mapping(address => bool) public isValidProperty;
 
+    // ACE eligibility policy (IIdentityValidator) per property, replacing the
+    // removed TokenCompliance lookup. Required for claims.
+    mapping(address => address) public propertyEligibilityPolicy;
+
     event DividendDeposited(address indexed property, uint256 indexed distributionId, uint256 amount, uint256 snapshotId);
     event DividendClaimed(address indexed property, uint256 indexed distributionId, address indexed user, uint256 amount);
     event ProtocolFeeUpdated(uint256 oldFee, uint256 newFee);
     event UnclaimedRecovered(address indexed property, uint256 indexed distributionId, uint256 amount);
     event PropertyValidated(address indexed property, bool valid);
+    event PropertyEligibilityPolicySet(address indexed property, address indexed policy);
 
     constructor(address _paymentToken, address _protocolWallet, address initialOwner) Ownable(initialOwner) {
         require(_paymentToken != address(0), "Invalid payment token");
@@ -88,6 +93,17 @@ contract DividendVault is Ownable, ReentrancyGuard, Pausable {
     function setPropertyValid(address property, bool valid) external onlyOwner {
         isValidProperty[property] = valid;
         emit PropertyValidated(property, valid);
+    }
+
+    /**
+     * @notice Wire the ACE eligibility policy a property's claims must pass.
+     * @param property Property token address
+     * @param eligibilityPolicy ACE eligibility policy (IIdentityValidator) of the product
+     */
+    function setPropertyEligibilityPolicy(address property, address eligibilityPolicy) external onlyOwner {
+        require(eligibilityPolicy != address(0), "Invalid eligibility policy");
+        propertyEligibilityPolicy[property] = eligibilityPolicy;
+        emit PropertyEligibilityPolicySet(property, eligibilityPolicy);
     }
 
     /**
@@ -212,12 +228,13 @@ contract DividendVault is Ownable, ReentrancyGuard, Pausable {
         }
     }
 
-    /// @dev Dividends are a benefit of compliant holding: frozen/unverified
-    /// holders accrue a share (snapshot math is untouched) but cannot pull
-    /// funds until they are verified or exempt again.
+    /// @dev Dividends are a benefit of compliant holding: holders whose
+    /// credentials are missing or lapsed accrue a share (snapshot math is
+    /// untouched) but cannot pull funds until they are eligible again.
     function _isCompliant(address property, address user) internal view returns (bool) {
-        TokenCompliance c = PropertyToken(payable(property)).compliance();
-        return c.identityRegistry().isVerified(user) || c.isExempt(user);
+        address policy = propertyEligibilityPolicy[property];
+        require(policy != address(0), "Eligibility policy not set");
+        return IIdentityValidator(policy).validate(user, "");
     }
 
     /**
