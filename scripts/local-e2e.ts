@@ -1,20 +1,26 @@
-import hre from "hardhat";
 import fs from "node:fs";
 import path from "node:path";
+import {
+	ethers,
+	contractAt,
+	baseEligibilityConfig,
+	onboard,
+	ccidFor,
+} from "../scripts/lib/ace-core";
 
 /**
- * End-to-end deployment validation against a local chain. Assumes the core
- * contracts are already deployed (scripts/deploy.ts) and reads their addresses
- * from deployment.localhost.json. Run via `pnpm test:e2e` (scripts/e2e-local.sh
+ * End-to-end deployment validation against a local chain. Assumes the ACE core
+ * is already deployed (scripts/deploy.ts) and reads its addresses from
+ * deployment.localhost.json. Run via `pnpm test:e2e` (scripts/e2e-local.sh
  * boots the chain and runs both steps) — see README Development.
  *
- * Exercises: investor KYC, factory-deployed PropertyToken + ListingEscrow,
- * compliance/vault wiring, a full native raise through finalize() with token
- * distribution, and deployment + wiring of the CRE consumer and CCIP identity
+ * Exercises: investor onboarding (CCID + credentials), factory-deployed ACE
+ * PropertyToken + ListingEscrow, engine-gated escrow deposits (eligibility +
+ * reject), a full native raise through finalize() with mint-based token
+ * distribution, dividend-vault wiring, the CRE consumer and the CCIP identity
  * sync pair.
  */
 
-const { ethers } = await hre.network.connect();
 const [deployer, investor] = await ethers.getSigners();
 
 const deploymentPath = path.join(
@@ -28,28 +34,19 @@ if (!fs.existsSync(deploymentPath)) {
 }
 const c = JSON.parse(fs.readFileSync(deploymentPath, "utf-8")).contracts;
 
-const registry = await ethers.getContractAt(
-	"IdentityRegistry",
-	c.IdentityRegistry,
-	deployer
-);
-const compliance = await ethers.getContractAt(
-	"TokenCompliance",
-	c.TokenCompliance,
-	deployer
-);
-const factory = await ethers.getContractAt(
-	"PropertyFactory",
-	c.PropertyFactory,
-	deployer
-);
-const vault = await ethers.getContractAt(
-	"DividendVault",
-	c.DividendVault,
-	deployer
-);
+const engine = contractAt("PolicyEngine", c.PolicyEngine, deployer);
+const registry = contractAt("IdentityRegistry", c.IdentityRegistry, deployer);
+const credentialRegistry = contractAt("CredentialRegistry", c.CredentialRegistry, deployer);
+const writerPolicy = contractAt("OnlyAuthorizedSenderPolicy", c.RegistryWriterPolicy, deployer);
+const rejectPolicy = contractAt("RejectPolicy", c.RejectPolicy, deployer);
+const factory = await ethers.getContractAt("PropertyFactory", c.PropertyFactory, deployer);
+const vault = await ethers.getContractAt("DividendVault", c.DividendVault, deployer);
 
-const KYC = ethers.keccak256(ethers.toUtf8Bytes("KYC"));
+const core = {
+	identityRegistry: registry,
+	credentialRegistry,
+};
+
 const SUPPLY = ethers.parseUnits("1000", 18);
 const TARGET = ethers.parseEther("1");
 
@@ -75,29 +72,46 @@ function parsedEvent(receipt: any, name: string) {
 	return evt;
 }
 
-// MARK: KYC
+// MARK: Onboarding (issuer flow: admin writes CCID + credentials)
 
-await (await registry.registerIdentity(investor.address, 840, KYC)).wait();
-assertEqual(await registry.isVerified(investor.address), true, "investor KYC");
-ok("investor KYC registered");
+await onboard(core, deployer, investor);
+assertEqual(
+	await registry.getIdentity(investor.address),
+	ccidFor(investor.address),
+	"investor identity"
+);
+ok("investor onboarded (CCID + KYC/AML credentials)");
 
-// MARK: Factory lifecycle
+// MARK: Factory lifecycle (ACE product)
 
-let rc = await (
-	await factory.deployProperty("E2E Prop", "E2EP", SUPPLY, c.TokenCompliance)
+const { sources, requirements } = baseEligibilityConfig(core);
+const productId = await factory.nextProductId();
+await (
+	await factory.createProduct(
+		"E2E Prop",
+		"E2EP",
+		18,
+		sources,
+		requirements,
+		true,
+		deployer.address,
+		deployer.address
+	)
 ).wait();
-const tokenAddr = parsedEvent(rc, "PropertyDeployed").args.property;
-const token = await ethers.getContractAt("PropertyToken", tokenAddr, deployer);
-ok(`PropertyToken deployed via factory: ${tokenAddr}`);
+const record = await factory.getProduct(productId);
+const token = await ethers.getContractAt("PropertyToken", record.token, deployer);
+ok(`PropertyToken deployed via factory: ${record.token}`);
 
 const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
-rc = await (
+const rc = await (
 	await factory.deployEscrow(
-		tokenAddr,
+		productId,
 		ethers.ZeroAddress, // native raise
-		deployer.address,
+		deployer.address, // sponsor
 		TARGET,
-		now + 3600n
+		SUPPLY,
+		now + 3600n,
+		deployer.address // admin
 	)
 ).wait();
 const escrowAddr = parsedEvent(rc, "EscrowDeployed").args.escrow;
@@ -106,15 +120,26 @@ ok(`ListingEscrow deployed via factory: ${escrowAddr}`);
 
 // MARK: Wiring
 
-await (await compliance.setExempt(escrowAddr, true)).wait();
-await (await token.transfer(escrowAddr, SUPPLY)).wait();
-await (await vault.setPropertyValid(tokenAddr, true)).wait();
+await (await vault.setPropertyValid(record.token, true)).wait();
+await (
+	await vault.setPropertyEligibilityPolicy(record.token, record.eligibilityPolicy)
+).wait();
 await (await token.setSnapshotter(c.DividendVault, true)).wait();
-ok("escrow exempted, supply escrowed, vault validated + snapshotter");
+ok("vault validated + eligibility policy wired + snapshotter set");
+
+// MARK: Escrow gating (engine-enforced)
+
+const outsider = (await ethers.getSigners())[2];
+await expectRevert(
+	escrow.connect(outsider).deposit(0n, { value: 2000n }),
+	"un-onboarded investor deposit blocked"
+);
+ok("deposit blocked for un-onboarded investor (PolicyRunRejected)");
 
 // MARK: Raise lifecycle
 
-await (await escrow.connect(investor).deposit(0, { value: TARGET })).wait();
+const sponsorBefore = await ethers.provider.getBalance(deployer.address);
+await (await escrow.connect(investor).deposit(0n, { value: TARGET })).wait();
 await ethers.provider.send("evm_increaseTime", [3700]);
 await ethers.provider.send("evm_mine", []);
 await (await escrow.finalize()).wait();
@@ -123,12 +148,25 @@ assertEqual(
 	SUPPLY,
 	"investor token balance after finalize"
 );
-assertEqual(
-	await ethers.provider.getBalance(tokenAddr),
-	TARGET,
-	"raise proceeds in PropertyToken vault"
+// proceeds moved to the sponsor directly at finalize (mint-on-finalize model);
+// allow a gas margin on the sponsor's balance delta
+const sponsorAfter = await ethers.provider.getBalance(deployer.address);
+if (sponsorAfter < sponsorBefore + TARGET - ethers.parseEther("0.01")) {
+	throw new Error(`sponsor proceeds: expected ~${TARGET}, got ${sponsorAfter - sponsorBefore}`);
+}
+ok("raise finalized: shares minted to investor, proceeds to sponsor");
+
+// MARK: Reject policy (screens the recipient, same as the previous
+// SanctionsPolicy behavior on transfer/transferFrom)
+
+await (await rejectPolicy.rejectAddress(deployer.address)).wait();
+await expectRevert(
+	token.connect(investor).transfer(deployer.address, 1n),
+	"transfer to a rejected recipient blocked"
 );
-ok("raise finalized: tokens distributed, proceeds in vault");
+await (await rejectPolicy.unrejectAddress(deployer.address)).wait();
+await (await token.connect(investor).transfer(deployer.address, 1n)).wait();
+ok("reject policy blocks sanctioned recipients and releases on un-reject");
 
 // MARK: Oracle + identity sync
 
@@ -144,14 +182,24 @@ const sender = await (
 await sender.waitForDeployment();
 const receiver = await (
 	await ethers.getContractFactory("IdentitySyncReceiver", deployer)
-).deploy(deployer.address, c.IdentityRegistry, deployer.address);
+).deploy(deployer.address, c.IdentityRegistry, c.CredentialRegistry, deployer.address);
 await receiver.waitForDeployment();
-await (
-	await registry.grantRole(await registry.SYNC_ROLE(), await receiver.getAddress())
-).wait();
+// the receiver writes to the destination registries through the writer policy
+await (await writerPolicy.authorizeSender(await receiver.getAddress())).wait();
 await (
 	await receiver.setTrustedSender(3478487238524512106n, await sender.getAddress())
 ).wait();
-ok("IdentitySyncSender/Receiver deployed and wired (SYNC_ROLE + trusted sender)");
+ok("IdentitySyncSender/Receiver deployed and wired (writer policy + trusted sender)");
 
 console.log("\nLOCAL E2E DEPLOYMENT: ALL CHECKS PASSED");
+
+async function expectRevert(promise: Promise<any>, what: string) {
+	try {
+		await promise;
+		throw new Error(`${what}: expected revert, transaction succeeded`);
+	} catch (e: any) {
+		if (e instanceof Error && e.message.includes("expected revert")) throw e;
+		// any revert is fine — the engine wraps rejections in PolicyRunRejected
+	}
+	ok(`${what}`);
+}
