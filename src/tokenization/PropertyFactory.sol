@@ -22,12 +22,6 @@ import {
 	CredentialRegistryIdentityValidatorPolicy
 } from "@chainlink/cross-chain-identity/CredentialRegistryIdentityValidatorPolicy.sol";
 import {
-	GroupedIdentityValidatorPolicy
-} from "@chainlink/cross-chain-identity/GroupedIdentityValidatorPolicy.sol";
-import {
-	IGroupedCredentialRequirements
-} from "@chainlink/cross-chain-identity/interfaces/IGroupedCredentialRequirements.sol";
-import {
 	ICredentialRequirements
 } from "@chainlink/cross-chain-identity/interfaces/ICredentialRequirements.sol";
 import {
@@ -62,12 +56,6 @@ contract PropertyFactory is Ownable {
 		address eligibilityPolicy;
 		address mintPolicy;
 		address adminPolicy;
-		address productOwner;
-		address tokenAdmin;
-		string name;
-		string symbol;
-		uint8 decimals;
-		bool grouped;
 	}
 
 	PolicyEngine public immutable policyEngine;
@@ -76,30 +64,20 @@ contract PropertyFactory is Ownable {
 	address public immutable sanctionsPolicy;
 	address public immutable tokenImplementation;
 	address public immutable eligibilityPolicyImplementation;
-	address public immutable groupedPolicyImplementation;
 	address public immutable senderPolicyImplementation;
-
-	bytes32 public immutable kycCredentialType;
-	bytes32 public immutable amlCredentialType;
-	bytes32 public immutable accreditedCredentialType;
 
 	uint256 public nextProductId = 1;
 
 	// Deployment registry for tracking
-	address[] public deployedProperties;
 	address[] public deployedEscrows;
-	mapping(address => bool) public isPropertyToken;
 	mapping(address => bool) public isEscrow;
 	mapping(uint256 => ProductRecord) private productsById;
-	mapping(address => uint256) public escrowProduct;
 
-	event PropertyDeployed(address indexed property, string name, string symbol, uint256 indexed index);
 	event EscrowDeployed(address indexed escrow, address indexed property, address paymentToken, uint256 indexed index);
 	event ProductCreated(
 		uint256 indexed productId,
 		address indexed token,
 		address indexed eligibilityPolicy,
-		bool grouped,
 		address productOwner,
 		address tokenAdmin
 	);
@@ -115,7 +93,6 @@ contract PropertyFactory is Ownable {
 		address sanctionsPolicy_,
 		address tokenImplementation_,
 		address eligibilityPolicyImplementation_,
-		address groupedPolicyImplementation_,
 		address senderPolicyImplementation_
 	) Ownable(initialOwner) {
 		if (policyEngine_ == address(0)) revert InvalidAddress();
@@ -124,7 +101,6 @@ contract PropertyFactory is Ownable {
 		sanctionsPolicy = sanctionsPolicy_;
 		tokenImplementation = tokenImplementation_;
 		eligibilityPolicyImplementation = eligibilityPolicyImplementation_;
-		groupedPolicyImplementation = groupedPolicyImplementation_;
 		senderPolicyImplementation = senderPolicyImplementation_;
 	}
 
@@ -154,51 +130,10 @@ contract PropertyFactory is Ownable {
 
 		eligibilityPolicy = address(_deployEligibilityPolicy(sources, requirements));
 		productId = _deployProduct(
-			name, symbol, decimals, false, eligibilityPolicy, resolvedOwner, resolvedAdmin,
+			name, symbol, decimals, eligibilityPolicy, resolvedOwner, resolvedAdmin,
 			mintRequiresEligibility
 		);
 		token = productsById[productId].token;
-	}
-
-	/**
-	 * @notice Creates a product with segmented eligibility: accredited
-	 * investors route to the accredited group (KYC + AML + accredited), all
-	 * other investors to the retail group (KYC + AML). First-match routing.
-	 * @param mintRequiresEligibility See createProduct.
-	 */
-	function createGroupedProduct(
-		string calldata name,
-		string calldata symbol,
-		uint8 decimals,
-		IGroupedCredentialRequirements.GroupInput[] calldata groups,
-		IGroupedCredentialRequirements.GroupRequirementInput[] calldata groupRequirements,
-		IGroupedCredentialRequirements.GroupSourceInput[] calldata groupSources,
-		bool mintRequiresEligibility,
-		address productOwner,
-		address tokenAdmin
-	) external onlyOwner returns (uint256 productId, address token, address eligibilityPolicy) {
-		if (bytes(name).length == 0 || bytes(name).length > 100) revert InvalidName();
-		if (bytes(symbol).length == 0 || bytes(symbol).length > 20) revert InvalidSymbol();
-
-		address resolvedOwner = productOwner == address(0) ? owner() : productOwner;
-		address resolvedAdmin = tokenAdmin == address(0) ? resolvedOwner : tokenAdmin;
-
-		eligibilityPolicy = address(_deployGroupedPolicy(groups, groupRequirements, groupSources));
-		productId = _deployProduct(
-			name, symbol, decimals, true, eligibilityPolicy, resolvedOwner, resolvedAdmin,
-			mintRequiresEligibility
-		);
-		token = productsById[productId].token;
-	}
-
-	/**
-	 * @notice Authorizes an operator (escrow, CCIP pool) as a minter on a
-	 * product's mint policy.
-	 */
-	function authorizeMinter(uint256 productId, address minter) external onlyOwner {
-		ProductRecord storage product = productsById[productId];
-		if (product.token == address(0)) revert ProductNotFound(productId);
-		OnlyAuthorizedSenderPolicy(product.mintPolicy).authorizeSender(minter);
 	}
 
 	/**
@@ -234,17 +169,9 @@ contract PropertyFactory is Ownable {
 
 		deployedEscrows.push(escrowAddress);
 		isEscrow[escrowAddress] = true;
-		escrowProduct[escrowAddress] = productId;
 
 		emit EscrowDeployed(escrowAddress, product.token, paymentToken, deployedEscrows.length - 1);
 		return escrowAddress;
-	}
-
-	/**
-	 * @notice Get all deployed property tokens
-	 */
-	function getDeployedProperties() external view returns (address[] memory) {
-		return deployedProperties;
 	}
 
 	/**
@@ -264,18 +191,16 @@ contract PropertyFactory is Ownable {
 		string calldata name,
 		string calldata symbol,
 		uint8 decimals,
-		bool grouped,
 		address eligibilityPolicy,
 		address productOwner,
 		address tokenAdmin,
 		bool mintRequiresEligibility
 	) internal returns (uint256 productId) {
 		// The factory keeps ownership of the mint policy so it can authorize
-		// escrows and CCIP pools as minters after deployment.
-		OnlyAuthorizedSenderPolicy mintPolicy = _deploySenderPolicy(owner());
-		OnlyAuthorizedSenderPolicy adminPolicy = _deploySenderPolicy(productOwner);
-		adminPolicy.authorizeSender(tokenAdmin);
-		adminPolicy.transferOwnership(productOwner);
+		// escrows and CCIP pools as minters after deployment; the admin policy
+		// is transferred to the product owner.
+		OnlyAuthorizedSenderPolicy mintPolicy = _deploySenderPolicy(productOwner, tokenAdmin, address(this));
+		OnlyAuthorizedSenderPolicy adminPolicy = _deploySenderPolicy(productOwner, tokenAdmin, productOwner);
 
 		address token = _deployToken(name, symbol, decimals, productOwner);
 		_attachTokenPolicies(
@@ -288,20 +213,10 @@ contract PropertyFactory is Ownable {
 			token: token,
 			eligibilityPolicy: eligibilityPolicy,
 			mintPolicy: address(mintPolicy),
-			adminPolicy: address(adminPolicy),
-			productOwner: productOwner,
-			tokenAdmin: tokenAdmin,
-			name: name,
-			symbol: symbol,
-			decimals: decimals,
-			grouped: grouped
+			adminPolicy: address(adminPolicy)
 		});
 
-		deployedProperties.push(token);
-		isPropertyToken[token] = true;
-
-		emit PropertyDeployed(token, name, symbol, deployedProperties.length - 1);
-		emit ProductCreated(productId, token, eligibilityPolicy, grouped, productOwner, tokenAdmin);
+		emit ProductCreated(productId, token, eligibilityPolicy, productOwner, tokenAdmin);
 	}
 
 	function _deployEligibilityPolicy(
@@ -316,25 +231,25 @@ contract PropertyFactory is Ownable {
 		);
 	}
 
-	function _deployGroupedPolicy(
-		IGroupedCredentialRequirements.GroupInput[] calldata groups,
-		IGroupedCredentialRequirements.GroupRequirementInput[] calldata groupRequirements,
-		IGroupedCredentialRequirements.GroupSourceInput[] calldata groupSources
-	) internal returns (GroupedIdentityValidatorPolicy) {
-		bytes memory initData = abi.encodeCall(
-			Policy.initialize, (address(policyEngine), owner(), abi.encode(groups, groupRequirements, groupSources))
-		);
-		return GroupedIdentityValidatorPolicy(
-			address(new ERC1967Proxy(groupedPolicyImplementation, initData))
-		);
-	}
-
-	function _deploySenderPolicy(address policyOwner) internal returns (OnlyAuthorizedSenderPolicy) {
+	/// @dev Creates a sender policy owned by the factory, authorizes the
+	/// listed accounts, then transfers ownership to `finalOwner` (the factory
+	/// itself when it must keep authorizing new minters).
+	function _deploySenderPolicy(
+		address authorize1,
+		address authorize2,
+		address finalOwner
+	) internal returns (OnlyAuthorizedSenderPolicy) {
 		bytes memory initData =
-			abi.encodeCall(Policy.initialize, (address(policyEngine), policyOwner, ""));
+			abi.encodeCall(Policy.initialize, (address(policyEngine), address(this), ""));
 		OnlyAuthorizedSenderPolicy policy =
 			OnlyAuthorizedSenderPolicy(address(new ERC1967Proxy(senderPolicyImplementation, initData)));
-		policy.authorizeSender(policyOwner);
+		policy.authorizeSender(authorize1);
+		if (authorize2 != authorize1) {
+			policy.authorizeSender(authorize2);
+		}
+		if (finalOwner != address(this)) {
+			policy.transferOwnership(finalOwner);
+		}
 		return policy;
 	}
 

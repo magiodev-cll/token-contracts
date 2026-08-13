@@ -1,20 +1,19 @@
 import { expect } from "chai";
 import hre from "hardhat";
-import { deployAceCore, createProduct, onboard, ccidFor } from "./helpers/ace";
+import { deployAceCore, baseEligibilityConfig, onboard, ccidFor } from "./helpers/ace";
 
-const { ethers } = await hre.network.connect();
+const { ethers } = await hre.network.getOrCreate();
 
 describe("Commertize ACE Contracts Suite", function () {
 	let admin: any;
 	let agent: any;
-	let compliance: any;
 	let user: any;
 	let sponsor: any;
 	let core: any;
 	let propertyToken: any;
 
 	before(async function () {
-		[admin, agent, compliance, user, sponsor] = await ethers.getSigners();
+		[admin, agent, user, sponsor] = await ethers.getSigners();
 		core = await deployAceCore(admin);
 	});
 
@@ -45,7 +44,7 @@ describe("Commertize ACE Contracts Suite", function () {
 			core.identityRegistry
 				.connect(agent)
 				.registerIdentity(ccidFor(agent.address), agent.address, "0x")
-		).to.be.revertedWith("sender is not authorized");
+		).to.be.revertedWithCustomError(core.engine, "PolicyRunRejected");
 	});
 
 	it("Should deploy PropertyToken and Escrow via Factory", async function () {
@@ -53,8 +52,23 @@ describe("Commertize ACE Contracts Suite", function () {
 		await onboard(core, admin, admin);
 		await onboard(core, admin, user);
 
-		const { productId, token } = await createProduct(core, admin);
-		propertyToken = token;
+		const { sources, requirements } = baseEligibilityConfig(core);
+		const productId = await core.factory.nextProductId();
+		await core.factory
+			.connect(admin)
+			.createProduct(
+				"Commertize Property",
+				"CPROP",
+				18,
+				sources,
+				requirements,
+				true,
+				admin.address,
+				admin.address
+			);
+		const record = await core.factory.getProduct(productId);
+		const PropertyToken = await ethers.getContractFactory("PropertyToken");
+		propertyToken = PropertyToken.attach(record.token);
 
 		expect(await propertyToken.name()).to.equal("Commertize Property");
 		expect(await propertyToken.getCCIPAdmin()).to.equal(admin.address);

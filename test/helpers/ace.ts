@@ -13,7 +13,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import hre from "hardhat";
 
-const { ethers } = await hre.network.connect();
+const { ethers } = await hre.network.getOrCreate();
 
 // Credential types (chainlink-ace convention: common. prefix)
 export const KYC = () => ethers.keccak256(ethers.toUtf8Bytes("common.kyc"));
@@ -69,13 +69,6 @@ export async function deployProxy(implementation: any, initData: string, contrac
 	await proxy.waitForDeployment();
 	const Contract = await aceFactory(contractName);
 	return Contract.attach(await proxy.getAddress());
-}
-
-async function deploy(name: string, ...args: any[]) {
-	const factory = await aceFactory(name);
-	const contract = await factory.deploy(...args);
-	await contract.waitForDeployment();
-	return contract;
 }
 
 export interface AceCore {
@@ -180,9 +173,6 @@ export async function deployAceCore(admin: any): Promise<AceCore> {
 	);
 	const eligibilityImplementation = await CredentialRegistryIdentityValidatorPolicy.deploy();
 	await eligibilityImplementation.waitForDeployment();
-	const GroupedIdentityValidatorPolicy = await aceFactory("GroupedIdentityValidatorPolicy");
-	const groupedImplementation = await GroupedIdentityValidatorPolicy.deploy();
-	await groupedImplementation.waitForDeployment();
 	const SenderPolicy = await aceFactory("OnlyAuthorizedSenderPolicy");
 	const senderPolicyImplementation = await SenderPolicy.deploy();
 	await senderPolicyImplementation.waitForDeployment();
@@ -194,7 +184,6 @@ export async function deployAceCore(admin: any): Promise<AceCore> {
 		sanctionsPolicy.target,
 		tokenImplementation.target,
 		eligibilityImplementation.target,
-		groupedImplementation.target,
 		senderPolicyImplementation.target
 	);
 	await factory.waitForDeployment();
@@ -253,51 +242,27 @@ export async function onboard(
 }
 
 /**
- * Creates a product and attaches its token contract.
+ * Eligibility configuration for a base product: KYC + AML sources and
+ * requirements against the shared registries.
  */
-export async function createProduct(
-	core: AceCore,
-	admin: any,
-	opts: {
-		name?: string;
-		symbol?: string;
-		requireAccredited?: boolean;
-		mintRequiresEligibility?: boolean;
-		grouped?: boolean;
-		productOwner?: any;
-	} = {}
-) {
-	const { factory } = core;
-	const owner = opts.productOwner ?? admin;
-	const productId = await factory.nextProductId();
+export function baseEligibilityConfig(core: AceCore, requireAccredited = false) {
+	const source = (type: string) => ({
+		credentialTypeId: type,
+		identityRegistry: core.identityRegistry.target,
+		credentialRegistry: core.credentialRegistry.target,
+		dataValidator: ethers.ZeroAddress,
+	});
+	const sources = [source(KYC()), source(AML())];
+	if (requireAccredited) sources.push(source(ACCREDITED()));
 
-	if (opts.grouped) {
-		await factory
-			.connect(admin)
-			.createGroupedProduct(
-				opts.name ?? "Commertize Property",
-				opts.symbol ?? "CPROP",
-				18,
-				opts.mintRequiresEligibility ?? true,
-				owner.address,
-				owner.address
-			);
-	} else {
-		await factory
-			.connect(admin)
-			.createProduct(
-				opts.name ?? "Commertize Property",
-				opts.symbol ?? "CPROP",
-				18,
-				opts.requireAccredited ?? false,
-				opts.mintRequiresEligibility ?? true,
-				owner.address,
-				owner.address
-			);
-	}
+	const requirement = (id: string, type: string) => ({
+		requirementId: ethers.keccak256(ethers.toUtf8Bytes(id)),
+		credentialTypeIds: [type],
+		minValidations: 1n,
+		invert: false,
+	});
+	const requirements = [requirement("commertize.requirement.kyc", KYC()), requirement("commertize.requirement.aml", AML())];
+	if (requireAccredited) requirements.push(requirement("commertize.requirement.accredited", ACCREDITED()));
 
-	const record = await factory.getProduct(productId);
-	const PropertyToken = await ethers.getContractFactory("PropertyToken");
-	const token = PropertyToken.attach(record.token);
-	return { productId, token, record };
+	return { sources, requirements };
 }
