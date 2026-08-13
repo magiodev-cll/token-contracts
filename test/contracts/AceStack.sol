@@ -18,3 +18,4 @@ pragma solidity ^0.8.24;
 // scripts instantiate them from the build-info output.
 import {ERC20TransferExtractor} from "@chainlink/ace/packages/policy-management/src/extractors/ERC20TransferExtractor.sol";
 import {ERC3643MintBurnExtractor} from "@chainlink/ace/packages/policy-management/src/extractors/ERC3643MintBurnExtractor.sol";
+import {BypassPolicy} from "@chainlink/ace/packages/policy-management/src/policies/BypassPolicy.sol";

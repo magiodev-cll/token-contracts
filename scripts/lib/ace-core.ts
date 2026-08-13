@@ -52,7 +52,7 @@ for (const f of fs.readdirSync(buildInfoDir)) {
 
 let signer: any;
 
-async function aceFactory(name: string) {
+export async function aceFactory(name: string) {
 	const entry = npmContracts[name];
 	if (!entry) throw new Error(`build-info artifact not found: ${name}`);
 	if (!signer) {

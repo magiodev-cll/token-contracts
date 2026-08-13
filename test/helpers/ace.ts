@@ -19,6 +19,9 @@ export {
 	sel,
 	ccidFor,
 	deployAceCore,
+	deployProxy,
+	aceFactory,
+	contractAt,
 	onboard,
 	baseEligibilityConfig,
 } from "../../scripts/lib/ace-core";

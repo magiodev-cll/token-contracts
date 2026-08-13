@@ -45,9 +45,7 @@ jobs:
 
       # TestnetValidation.ts self-skips via process.exit(0) and would end the
       # run early — list the unit suites explicitly (see README Development).
-      #
-      # WIP (ACE migration): IdentitySync + CCIPCompliantPool are still being
-      # ported and are re-enabled as they land. PropertyNavOracle is untouched.
+      # PropertyNavOracle is untouched by the ACE migration.
       - name: Unit tests
         run: >
           pnpm hardhat test
@@ -56,6 +54,8 @@ jobs:
           test/ListingEscrowRefund.ts
           test/ListingEscrowDistribution.ts
           test/DividendVault.ts
+          test/IdentitySync.ts
+          test/CCIPCompliantPool.ts
           test/PropertyNavOracle.ts
 
       - name: Local E2E deployment validation

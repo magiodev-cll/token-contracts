@@ -69,10 +69,13 @@ contract PropertyToken is ComplianceTokenERC3643 {
 		return _currentSnapshotId;
 	}
 
-	/// @notice IBurnMintERC20 surface: burns the caller's balance through the
-	/// policy-protected `burn(address,uint256)`.
+	/// @notice IBurnMintERC20 surface: burns the caller's balance directly.
+	/// @dev Unrestricted self-burn (anyone can burn what they hold), matching
+	/// the old ComplianceEnabled model where burns were always allowed. The
+	/// policy-protected `burn(address,uint256)` remains for admin-managed
+	/// burns via the engine.
 	function burn(uint256 amount) external {
-		this.burn(msg.sender, amount);
+		_burn(msg.sender, amount);
 	}
 
 	/// @notice IBurnMintERC20 surface: burns `account`'s balance up to its
@@ -83,7 +86,7 @@ contract PropertyToken is ComplianceTokenERC3643 {
 			require(currentAllowance >= amount, "ERC20: burn amount exceeds allowance");
 			_approve(account, msg.sender, currentAllowance - amount);
 		}
-		this.burn(account, amount);
+		_burn(account, amount);
 	}
 
 	// Overrides
