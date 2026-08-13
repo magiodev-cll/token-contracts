@@ -1,8 +1,6 @@
 import { ethers } from "ethers";
 
 // Artifact imports
-import IdentityRegistryArtifact from "./artifacts/src/compliance/IdentityRegistry.sol/IdentityRegistry.json";
-import TokenComplianceArtifact from "./artifacts/src/compliance/TokenCompliance.sol/TokenCompliance.json";
 import DividendVaultArtifact from "./artifacts/src/finance/DividendVault.sol/DividendVault.json";
 import ListingEscrowArtifact from "./artifacts/src/finance/ListingEscrow.sol/ListingEscrow.json";
 import PropertyFactoryArtifact from "./artifacts/src/tokenization/PropertyFactory.sol/PropertyFactory.json";
@@ -240,9 +238,42 @@ const ERC20_PERMIT_ABI = [
 ] as const;
 
 /** Contract ABIs (ethers/viem compatible). */
+/** Minimal ABI for the ACE IdentityRegistry (full ABI ships with @chainlink/ace). */
+const IDENTITY_REGISTRY_ABI = [
+	{
+		inputs: [
+			{ name: "ccid", type: "bytes32" },
+			{ name: "account", type: "address" },
+			{ name: "context", type: "bytes" },
+		],
+		name: "registerIdentity",
+		outputs: [],
+		stateMutability: "nonpayable",
+		type: "function",
+	},
+	{
+		inputs: [
+			{ name: "ccid", type: "bytes32" },
+			{ name: "account", type: "address" },
+			{ name: "context", type: "bytes" },
+		],
+		name: "removeIdentity",
+		outputs: [],
+		stateMutability: "nonpayable",
+		type: "function",
+	},
+	{
+		inputs: [{ name: "account", type: "address" }],
+		name: "getIdentity",
+		outputs: [{ name: "", type: "bytes32" }],
+		stateMutability: "view",
+		type: "function",
+	},
+] as const;
+
+/** Contract ABIs (ethers/viem compatible). */
 export const ABIS = {
-	IdentityRegistry: IdentityRegistryArtifact.abi,
-	Compliance: TokenComplianceArtifact.abi,
+	IdentityRegistry: [...IDENTITY_REGISTRY_ABI],
 	USDC: [...ERC20_PERMIT_ABI],
 	DividendVault: DividendVaultArtifact.abi,
 	PropertyFactory: PropertyFactoryArtifact.abi,
@@ -256,8 +287,6 @@ export const ABIS = {
 export const ListingEscrowAbi = ListingEscrowArtifact.abi;
 
 /** Full artifacts (ABI + bytecode) for backend deployment via ContractFactory. */
-export { default as IdentityRegistryArtifact } from "./artifacts/src/compliance/IdentityRegistry.sol/IdentityRegistry.json";
-export { default as TokenComplianceArtifact } from "./artifacts/src/compliance/TokenCompliance.sol/TokenCompliance.json";
 export { default as IdentitySyncSenderArtifact } from "./artifacts/src/ccip/IdentitySyncSender.sol/IdentitySyncSender.json";
 export { default as PropertyNavConsumerArtifact } from "./artifacts/src/oracle/PropertyNavConsumer.sol/PropertyNavConsumer.json";
 
@@ -294,8 +323,6 @@ export const getPropertyNavConsumerContract = (
 	address: string,
 	runner: ethers.ContractRunner
 ) => new ethers.Contract(address, ABIS.PropertyNavConsumer, runner);
-export const getComplianceContract = (runner: ethers.ContractRunner) =>
-	new ethers.Contract(CONTRACTS.TokenCompliance, ABIS.Compliance, runner);
 export const getUSDCContract = (runner: ethers.ContractRunner) =>
 	new ethers.Contract(CONTRACTS.USDC || USDC_ADDRESS, ABIS.USDC, runner);
 export const getDividendVaultContract = (runner: ethers.ContractRunner) =>
