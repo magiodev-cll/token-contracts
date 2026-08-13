@@ -1,109 +1,91 @@
 import { expect } from "chai";
 import hre from "hardhat";
+import { deployAceCore, createProduct, onboard, ccidFor } from "./helpers/ace";
 
 const { ethers } = await hre.network.connect();
 
-describe("Commertize Contracts Suite", function () {
+describe("Commertize ACE Contracts Suite", function () {
 	let admin: any;
 	let agent: any;
 	let compliance: any;
 	let user: any;
 	let sponsor: any;
-	let identityRegistry: any;
-	let tokenCompliance: any;
-	let propertyFactory: any;
+	let core: any;
 	let propertyToken: any;
 
 	before(async function () {
 		[admin, agent, compliance, user, sponsor] = await ethers.getSigners();
+		core = await deployAceCore(admin);
 	});
 
-	it("Should deploy Identity Registry", async function () {
-		const IdentityRegistry =
-			await ethers.getContractFactory("IdentityRegistry");
-		identityRegistry = await IdentityRegistry.deploy(admin.address);
-		await identityRegistry.waitForDeployment();
-
-		const DEFAULT_ADMIN_ROLE = await identityRegistry.DEFAULT_ADMIN_ROLE();
-		expect(await identityRegistry.hasRole(DEFAULT_ADMIN_ROLE, admin.address)).to
-			.be.true;
-	});
-
-	it("Should deploy Token Compliance", async function () {
-		const TokenCompliance = await ethers.getContractFactory("TokenCompliance");
-		tokenCompliance = await TokenCompliance.deploy(
-			identityRegistry.target,
-			admin.address
+	it("Should deploy the ACE registries behind the policy engine", async function () {
+		expect(await core.identityRegistry.getPolicyEngine()).to.equal(
+			core.engine.target
 		);
-		await tokenCompliance.waitForDeployment();
-
-		expect(await tokenCompliance.identityRegistry()).to.equal(
-			identityRegistry.target
+		expect(await core.credentialRegistry.getPolicyEngine()).to.equal(
+			core.engine.target
 		);
 	});
 
-	it("Should deploy Property Factory", async function () {
-		const PropertyFactory = await ethers.getContractFactory("PropertyFactory");
-		propertyFactory = await PropertyFactory.deploy(admin.address);
-		await propertyFactory.waitForDeployment();
+	it("Should deploy the Property Factory", async function () {
+		expect(await core.factory.owner()).to.equal(admin.address);
+	});
 
-		expect(await propertyFactory.owner()).to.equal(admin.address);
+	it("Only authorized senders can write to the registries", async function () {
+		// admin is authorized on the writer policy
+		await core.identityRegistry
+			.connect(admin)
+			.registerIdentity(ccidFor(agent.address), agent.address, "0x");
+		await core.identityRegistry
+			.connect(admin)
+			.removeIdentity(ccidFor(agent.address), agent.address, "0x");
+
+		// anyone else is rejected by the policy chain
+		await expect(
+			core.identityRegistry
+				.connect(agent)
+				.registerIdentity(ccidFor(agent.address), agent.address, "0x")
+		).to.be.revertedWith("sender is not authorized");
 	});
 
 	it("Should deploy PropertyToken and Escrow via Factory", async function () {
-		// Register Admin to allow minting (checking compliance)
-		await identityRegistry
-			.connect(admin)
-			.registerIdentity(
-				admin.address,
-				840,
-				ethers.keccak256(ethers.toUtf8Bytes("admin"))
-			);
+		// Onboard admin so they can be minted to and act as product owner.
+		await onboard(core, admin, admin);
+		await onboard(core, admin, user);
 
-		const tx = await propertyFactory
-			.connect(admin)
-			.deployProperty("Test Property", "TST", 1000000, tokenCompliance.target);
-		const receipt = await tx.wait();
-		const event = receipt!.logs.find((log: any) => {
-			try {
-				return (
-					propertyFactory.interface.parseLog(log)!.name === "PropertyDeployed"
-				);
-			} catch {
-				return false;
-			}
-		});
-		const propertyTokenAddress = propertyFactory.interface.parseLog(event!)!
-			.args.property;
-		const PropertyToken = await ethers.getContractFactory("PropertyToken");
-		propertyToken = PropertyToken.attach(propertyTokenAddress);
+		const { productId, token } = await createProduct(core, admin);
+		propertyToken = token;
 
-		expect(await propertyToken.name()).to.equal("Test Property");
+		expect(await propertyToken.name()).to.equal("Commertize Property");
+		expect(await propertyToken.getCCIPAdmin()).to.equal(admin.address);
+
+		// mint is policy-gated: authorized minter + eligible recipient
+		await propertyToken.connect(admin).mint(user.address, ethers.parseEther("1000"));
 
 		// Deploy Escrow
 		const deadline = Math.floor(Date.now() / 1000) + 3600;
-		const tx2 = await propertyFactory
+		const tx = await core.factory
 			.connect(admin)
 			.deployEscrow(
-				propertyTokenAddress,
+				productId,
 				ethers.ZeroAddress,
 				sponsor.address,
 				ethers.parseEther("1.0"),
-				deadline
+				ethers.parseEther("1000"),
+				deadline,
+				admin.address
 			);
-		const receipt2 = await tx2.wait();
-		const event2 = receipt2!.logs.find((log: any) => {
+		const receipt = await tx.wait();
+		const event = receipt!.logs.find((log: any) => {
 			try {
-				return (
-					propertyFactory.interface.parseLog(log)!.name === "EscrowDeployed"
-				);
+				return core.factory.interface.parseLog(log)!.name === "EscrowDeployed";
 			} catch {
 				return false;
 			}
 		});
-		const escrowAddress = propertyFactory.interface.parseLog(event2!)!.args
-			.escrow;
+		const escrowAddress = core.factory.interface.parseLog(event!)!.args.escrow;
 
 		expect(escrowAddress).to.not.equal(ethers.ZeroAddress);
+		expect(await core.factory.isEscrow(escrowAddress)).to.equal(true);
 	});
 });
