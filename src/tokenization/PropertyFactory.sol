@@ -75,6 +75,9 @@ contract PropertyFactory is Ownable {
 	address public immutable credentialRegistry;
 	address public immutable sanctionsPolicy;
 	address public immutable tokenImplementation;
+	address public immutable eligibilityPolicyImplementation;
+	address public immutable groupedPolicyImplementation;
+	address public immutable senderPolicyImplementation;
 
 	bytes32 public immutable kycCredentialType;
 	bytes32 public immutable amlCredentialType;
@@ -109,36 +112,37 @@ contract PropertyFactory is Ownable {
 	constructor(
 		address initialOwner,
 		address policyEngine_,
-		address identityRegistry_,
-		address credentialRegistry_,
 		address sanctionsPolicy_,
-		bytes32 kycCredentialType_,
-		bytes32 amlCredentialType_,
-		bytes32 accreditedCredentialType_
+		address tokenImplementation_,
+		address eligibilityPolicyImplementation_,
+		address groupedPolicyImplementation_,
+		address senderPolicyImplementation_
 	) Ownable(initialOwner) {
-		if (policyEngine_ == address(0) || identityRegistry_ == address(0) || credentialRegistry_ == address(0)) {
-			revert InvalidAddress();
-		}
+		if (policyEngine_ == address(0)) revert InvalidAddress();
 
 		policyEngine = PolicyEngine(policyEngine_);
-		identityRegistry = identityRegistry_;
-		credentialRegistry = credentialRegistry_;
 		sanctionsPolicy = sanctionsPolicy_;
-		kycCredentialType = kycCredentialType_;
-		amlCredentialType = amlCredentialType_;
-		accreditedCredentialType = accreditedCredentialType_;
-		tokenImplementation = address(new PropertyToken());
+		tokenImplementation = tokenImplementation_;
+		eligibilityPolicyImplementation = eligibilityPolicyImplementation_;
+		groupedPolicyImplementation = groupedPolicyImplementation_;
+		senderPolicyImplementation = senderPolicyImplementation_;
 	}
 
 	/**
 	 * @notice Creates a product with a single eligibility requirement set
 	 * (KYC + AML, optionally + accredited).
+	 * @param mintRequiresEligibility When true, mint checks the recipient's
+	 * eligibility (issuance); when false, mint is authorization-only so a CCIP
+	 * pool can deliver bridged tokens unconditionally (mint-and-freeze:
+	 * transfers stay eligibility-gated).
 	 */
 	function createProduct(
 		string calldata name,
 		string calldata symbol,
 		uint8 decimals,
-		bool requireAccredited,
+		ICredentialRequirements.CredentialSourceInput[] calldata sources,
+		ICredentialRequirements.CredentialRequirementInput[] calldata requirements,
+		bool mintRequiresEligibility,
 		address productOwner,
 		address tokenAdmin
 	) external onlyOwner returns (uint256 productId, address token, address eligibilityPolicy) {
@@ -148,9 +152,10 @@ contract PropertyFactory is Ownable {
 		address resolvedOwner = productOwner == address(0) ? owner() : productOwner;
 		address resolvedAdmin = tokenAdmin == address(0) ? resolvedOwner : tokenAdmin;
 
-		eligibilityPolicy = address(_deployEligibilityPolicy(requireAccredited));
+		eligibilityPolicy = address(_deployEligibilityPolicy(sources, requirements));
 		productId = _deployProduct(
-			name, symbol, decimals, false, eligibilityPolicy, resolvedOwner, resolvedAdmin
+			name, symbol, decimals, false, eligibilityPolicy, resolvedOwner, resolvedAdmin,
+			mintRequiresEligibility
 		);
 		token = productsById[productId].token;
 	}
@@ -159,11 +164,16 @@ contract PropertyFactory is Ownable {
 	 * @notice Creates a product with segmented eligibility: accredited
 	 * investors route to the accredited group (KYC + AML + accredited), all
 	 * other investors to the retail group (KYC + AML). First-match routing.
+	 * @param mintRequiresEligibility See createProduct.
 	 */
 	function createGroupedProduct(
 		string calldata name,
 		string calldata symbol,
 		uint8 decimals,
+		IGroupedCredentialRequirements.GroupInput[] calldata groups,
+		IGroupedCredentialRequirements.GroupRequirementInput[] calldata groupRequirements,
+		IGroupedCredentialRequirements.GroupSourceInput[] calldata groupSources,
+		bool mintRequiresEligibility,
 		address productOwner,
 		address tokenAdmin
 	) external onlyOwner returns (uint256 productId, address token, address eligibilityPolicy) {
@@ -173,11 +183,22 @@ contract PropertyFactory is Ownable {
 		address resolvedOwner = productOwner == address(0) ? owner() : productOwner;
 		address resolvedAdmin = tokenAdmin == address(0) ? resolvedOwner : tokenAdmin;
 
-		eligibilityPolicy = address(_deployGroupedPolicy());
+		eligibilityPolicy = address(_deployGroupedPolicy(groups, groupRequirements, groupSources));
 		productId = _deployProduct(
-			name, symbol, decimals, true, eligibilityPolicy, resolvedOwner, resolvedAdmin
+			name, symbol, decimals, true, eligibilityPolicy, resolvedOwner, resolvedAdmin,
+			mintRequiresEligibility
 		);
 		token = productsById[productId].token;
+	}
+
+	/**
+	 * @notice Authorizes an operator (escrow, CCIP pool) as a minter on a
+	 * product's mint policy.
+	 */
+	function authorizeMinter(uint256 productId, address minter) external onlyOwner {
+		ProductRecord storage product = productsById[productId];
+		if (product.token == address(0)) revert ProductNotFound(productId);
+		OnlyAuthorizedSenderPolicy(product.mintPolicy).authorizeSender(minter);
 	}
 
 	/**
@@ -246,7 +267,8 @@ contract PropertyFactory is Ownable {
 		bool grouped,
 		address eligibilityPolicy,
 		address productOwner,
-		address tokenAdmin
+		address tokenAdmin,
+		bool mintRequiresEligibility
 	) internal returns (uint256 productId) {
 		// The factory keeps ownership of the mint policy so it can authorize
 		// escrows and CCIP pools as minters after deployment.
@@ -256,7 +278,9 @@ contract PropertyFactory is Ownable {
 		adminPolicy.transferOwnership(productOwner);
 
 		address token = _deployToken(name, symbol, decimals, productOwner);
-		_attachTokenPolicies(token, eligibilityPolicy, address(mintPolicy), address(adminPolicy));
+		_attachTokenPolicies(
+			token, eligibilityPolicy, address(mintPolicy), address(adminPolicy), mintRequiresEligibility
+		);
 
 		productId = nextProductId++;
 		productsById[productId] = ProductRecord({
@@ -280,43 +304,36 @@ contract PropertyFactory is Ownable {
 		emit ProductCreated(productId, token, eligibilityPolicy, grouped, productOwner, tokenAdmin);
 	}
 
-	function _deployEligibilityPolicy(bool requireAccredited)
-		internal
-		returns (CredentialRegistryIdentityValidatorPolicy)
-	{
-		ICredentialRequirements.CredentialSourceInput[] memory sources = _buildSources(requireAccredited);
-		ICredentialRequirements.CredentialRequirementInput[] memory requirements =
-			_buildRequirements(requireAccredited);
-
-		CredentialRegistryIdentityValidatorPolicy implementation = new CredentialRegistryIdentityValidatorPolicy();
+	function _deployEligibilityPolicy(
+		ICredentialRequirements.CredentialSourceInput[] calldata sources,
+		ICredentialRequirements.CredentialRequirementInput[] calldata requirements
+	) internal returns (CredentialRegistryIdentityValidatorPolicy) {
 		bytes memory initData = abi.encodeCall(
 			Policy.initialize, (address(policyEngine), owner(), abi.encode(sources, requirements))
 		);
 		return CredentialRegistryIdentityValidatorPolicy(
-			address(new ERC1967Proxy(address(implementation), initData))
+			address(new ERC1967Proxy(eligibilityPolicyImplementation, initData))
 		);
 	}
 
-	function _deployGroupedPolicy() internal returns (GroupedIdentityValidatorPolicy) {
-		(
-			IGroupedCredentialRequirements.GroupInput[] memory groups,
-			IGroupedCredentialRequirements.GroupRequirementInput[] memory requirements,
-			IGroupedCredentialRequirements.GroupSourceInput[] memory sources
-		) = _buildGroupedConfig();
-
-		GroupedIdentityValidatorPolicy implementation = new GroupedIdentityValidatorPolicy();
+	function _deployGroupedPolicy(
+		IGroupedCredentialRequirements.GroupInput[] calldata groups,
+		IGroupedCredentialRequirements.GroupRequirementInput[] calldata groupRequirements,
+		IGroupedCredentialRequirements.GroupSourceInput[] calldata groupSources
+	) internal returns (GroupedIdentityValidatorPolicy) {
 		bytes memory initData = abi.encodeCall(
-			Policy.initialize, (address(policyEngine), owner(), abi.encode(groups, requirements, sources))
+			Policy.initialize, (address(policyEngine), owner(), abi.encode(groups, groupRequirements, groupSources))
 		);
-		return GroupedIdentityValidatorPolicy(address(new ERC1967Proxy(address(implementation), initData)));
+		return GroupedIdentityValidatorPolicy(
+			address(new ERC1967Proxy(groupedPolicyImplementation, initData))
+		);
 	}
 
 	function _deploySenderPolicy(address policyOwner) internal returns (OnlyAuthorizedSenderPolicy) {
-		OnlyAuthorizedSenderPolicy implementation = new OnlyAuthorizedSenderPolicy();
 		bytes memory initData =
 			abi.encodeCall(Policy.initialize, (address(policyEngine), policyOwner, ""));
 		OnlyAuthorizedSenderPolicy policy =
-			OnlyAuthorizedSenderPolicy(address(new ERC1967Proxy(address(implementation), initData)));
+			OnlyAuthorizedSenderPolicy(address(new ERC1967Proxy(senderPolicyImplementation, initData)));
 		policy.authorizeSender(policyOwner);
 		return policy;
 	}
@@ -341,7 +358,8 @@ contract PropertyFactory is Ownable {
 		address token,
 		address eligibilityPolicy,
 		address mintPolicy,
-		address adminPolicy
+		address adminPolicy,
+		bool mintRequiresEligibility
 	) internal {
 		bytes32[] memory emptyParams = new bytes32[](0);
 		bytes32[] memory transferParams = new bytes32[](2);
@@ -366,7 +384,9 @@ contract PropertyFactory is Ownable {
 		);
 
 		policyEngine.addPolicy(token, ComplianceTokenERC3643.mint.selector, mintPolicy, emptyParams);
-		policyEngine.addPolicy(token, ComplianceTokenERC3643.mint.selector, eligibilityPolicy, accountParams);
+		if (mintRequiresEligibility) {
+			policyEngine.addPolicy(token, ComplianceTokenERC3643.mint.selector, eligibilityPolicy, accountParams);
+		}
 
 		policyEngine.addPolicy(token, ComplianceTokenERC3643.burn.selector, adminPolicy, emptyParams);
 		policyEngine.addPolicy(token, ComplianceTokenERC3643.pause.selector, adminPolicy, emptyParams);
@@ -387,183 +407,12 @@ contract PropertyFactory is Ownable {
 		);
 	}
 
-	function _buildSources(bool requireAccredited)
-		internal
-		view
-		returns (ICredentialRequirements.CredentialSourceInput[] memory sources)
-	{
-		uint256 sourceCount = requireAccredited ? 3 : 2;
-		sources = new ICredentialRequirements.CredentialSourceInput[](sourceCount);
 
-		sources[0] = ICredentialRequirements.CredentialSourceInput({
-			credentialTypeId: kycCredentialType,
-			identityRegistry: identityRegistry,
-			credentialRegistry: credentialRegistry,
-			dataValidator: address(0)
-		});
-		sources[1] = ICredentialRequirements.CredentialSourceInput({
-			credentialTypeId: amlCredentialType,
-			identityRegistry: identityRegistry,
-			credentialRegistry: credentialRegistry,
-			dataValidator: address(0)
-		});
-
-		if (requireAccredited) {
-			sources[2] = ICredentialRequirements.CredentialSourceInput({
-				credentialTypeId: accreditedCredentialType,
-				identityRegistry: identityRegistry,
-				credentialRegistry: credentialRegistry,
-				dataValidator: address(0)
-			});
-		}
-	}
-
-	function _buildRequirements(bool requireAccredited)
-		internal
-		view
-		returns (ICredentialRequirements.CredentialRequirementInput[] memory requirements)
-	{
-		uint256 requirementCount = requireAccredited ? 3 : 2;
-		requirements = new ICredentialRequirements.CredentialRequirementInput[](requirementCount);
-
-		bytes32[] memory kycRequired = new bytes32[](1);
-		kycRequired[0] = kycCredentialType;
-		requirements[0] = ICredentialRequirements.CredentialRequirementInput({
-			requirementId: keccak256("commertize.requirement.kyc"),
-			credentialTypeIds: kycRequired,
-			minValidations: 1,
-			invert: false
-		});
-
-		bytes32[] memory amlRequired = new bytes32[](1);
-		amlRequired[0] = amlCredentialType;
-		requirements[1] = ICredentialRequirements.CredentialRequirementInput({
-			requirementId: keccak256("commertize.requirement.aml"),
-			credentialTypeIds: amlRequired,
-			minValidations: 1,
-			invert: false
-		});
-
-		if (requireAccredited) {
-			bytes32[] memory accreditedRequired = new bytes32[](1);
-			accreditedRequired[0] = accreditedCredentialType;
-			requirements[2] = ICredentialRequirements.CredentialRequirementInput({
-				requirementId: keccak256("commertize.requirement.accredited"),
-				credentialTypeIds: accreditedRequired,
-				minValidations: 1,
-				invert: false
-			});
-		}
-	}
 
 	/// @dev Two groups, first-match routing: accredited (KYC+AML+accredited)
 	/// before retail (KYC+AML). Every requirement's credential type needs a
 	/// source entry in its group (the retail group also needs an accredited
 	/// source for its inverted requirement).
-	function _buildGroupedConfig()
-		internal
-		view
-		returns (
-			IGroupedCredentialRequirements.GroupInput[] memory groups,
-			IGroupedCredentialRequirements.GroupRequirementInput[] memory requirements,
-			IGroupedCredentialRequirements.GroupSourceInput[] memory sources
-		)
-	{
-		bytes32 accreditedGroup = keccak256("commertize.group.accredited");
-		bytes32 retailGroup = keccak256("commertize.group.retail");
 
-		groups = new IGroupedCredentialRequirements.GroupInput[](2);
 
-		bytes32[] memory accreditedRouting = new bytes32[](1);
-		accreditedRouting[0] = accreditedCredentialType;
-		groups[0] = IGroupedCredentialRequirements.GroupInput({
-			groupId: accreditedGroup,
-			routingCredentialTypeIds: accreditedRouting,
-			routingKind: IGroupedCredentialRequirements.RoutingKind.Attestation,
-			routingCriteria: new bytes32[](0),
-			routingMinValidations: 1
-		});
-
-		bytes32[] memory retailRouting = new bytes32[](1);
-		retailRouting[0] = kycCredentialType;
-		groups[1] = IGroupedCredentialRequirements.GroupInput({
-			groupId: retailGroup,
-			routingCredentialTypeIds: retailRouting,
-			routingKind: IGroupedCredentialRequirements.RoutingKind.Attestation,
-			routingCriteria: new bytes32[](0),
-			routingMinValidations: 1
-		});
-
-		requirements = new IGroupedCredentialRequirements.GroupRequirementInput[](6);
-
-		requirements[0] = IGroupedCredentialRequirements.GroupRequirementInput({
-			groupId: accreditedGroup,
-			requirementId: keccak256("commertize.requirement.kyc"),
-			credentialTypeIds: _singleton(kycCredentialType),
-			minValidations: 1,
-			invert: false
-		});
-		requirements[1] = IGroupedCredentialRequirements.GroupRequirementInput({
-			groupId: accreditedGroup,
-			requirementId: keccak256("commertize.requirement.aml"),
-			credentialTypeIds: _singleton(amlCredentialType),
-			minValidations: 1,
-			invert: false
-		});
-		requirements[2] = IGroupedCredentialRequirements.GroupRequirementInput({
-			groupId: accreditedGroup,
-			requirementId: keccak256("commertize.requirement.accredited"),
-			credentialTypeIds: _singleton(accreditedCredentialType),
-			minValidations: 1,
-			invert: false
-		});
-		requirements[3] = IGroupedCredentialRequirements.GroupRequirementInput({
-			groupId: retailGroup,
-			requirementId: keccak256("commertize.requirement.kyc"),
-			credentialTypeIds: _singleton(kycCredentialType),
-			minValidations: 1,
-			invert: false
-		});
-		requirements[4] = IGroupedCredentialRequirements.GroupRequirementInput({
-			groupId: retailGroup,
-			requirementId: keccak256("commertize.requirement.aml"),
-			credentialTypeIds: _singleton(amlCredentialType),
-			minValidations: 1,
-			invert: false
-		});
-		requirements[5] = IGroupedCredentialRequirements.GroupRequirementInput({
-			groupId: retailGroup,
-			requirementId: keccak256("commertize.requirement.accredited"),
-			credentialTypeIds: _singleton(accreditedCredentialType),
-			minValidations: 1,
-			invert: true
-		});
-
-		sources = new IGroupedCredentialRequirements.GroupSourceInput[](6);
-		sources[0] = _source(accreditedGroup, kycCredentialType);
-		sources[1] = _source(accreditedGroup, amlCredentialType);
-		sources[2] = _source(accreditedGroup, accreditedCredentialType);
-		sources[3] = _source(retailGroup, kycCredentialType);
-		sources[4] = _source(retailGroup, amlCredentialType);
-		sources[5] = _source(retailGroup, accreditedCredentialType);
-	}
-
-	function _source(bytes32 groupId, bytes32 credentialTypeId)
-		internal
-		view
-		returns (IGroupedCredentialRequirements.GroupSourceInput memory)
-	{
-		return IGroupedCredentialRequirements.GroupSourceInput({
-			groupId: groupId,
-			credentialTypeId: credentialTypeId,
-			identityRegistry: identityRegistry,
-			credentialRegistry: credentialRegistry,
-			dataValidator: address(0)
-		});
-	}
-
-	function _singleton(bytes32 value) internal pure returns (bytes32[] memory arr) {
-		arr = new bytes32[](1);
-		arr[0] = value;
-	}
 }
