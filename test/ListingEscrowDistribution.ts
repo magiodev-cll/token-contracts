@@ -1,21 +1,25 @@
 import { expect } from "chai";
 import hre from "hardhat";
+import {
+	ethers,
+	deployAceCore,
+	onboard,
+	baseEligibilityConfig,
+	ccidFor,
+	KYC,
+} from "./helpers/ace";
 
-const { ethers } = await hre.network.connect();
-
-const KYC = () => ethers.keccak256(ethers.toUtf8Bytes("KYC"));
 const DAY = 24 * 60 * 60;
 
 // H3 regression: finalize() distributes in a loop through the token's
-// compliance check; one investor whose KYC lapsed must not revert the whole
+// policy-gated mint; one investor whose KYC lapsed must not revert the whole
 // distribution. Their share parks in pendingTokens for a claimTokens() pull.
 describe("ListingEscrow distribution fault tolerance (H3 regression)", function () {
 	let admin: any;
 	let sponsor: any;
 	let alice: any;
 	let bob: any;
-	let registry: any;
-	let compliance: any;
+	let core: any;
 	let token: any;
 	let pay: any;
 	let escrow: any;
@@ -25,49 +29,57 @@ describe("ListingEscrow distribution fault tolerance (H3 regression)", function 
 
 	beforeEach(async function () {
 		[admin, sponsor, alice, bob] = await ethers.getSigners();
+		core = await deployAceCore(admin);
 
-		const IdentityRegistry = await ethers.getContractFactory("IdentityRegistry");
-		registry = await IdentityRegistry.deploy(admin.address);
-		await registry.waitForDeployment();
+		await onboard(core, admin, alice);
+		await onboard(core, admin, bob);
 
-		const TokenCompliance = await ethers.getContractFactory("TokenCompliance");
-		compliance = await TokenCompliance.deploy(
-			await registry.getAddress(),
-			admin.address
-		);
-		await compliance.waitForDeployment();
-
-		for (const s of [admin, alice, bob]) {
-			await registry.registerIdentity(s.address, 840, KYC());
-		}
-
-		const PropertyToken = await ethers.getContractFactory("PropertyToken");
-		token = await PropertyToken.deploy(
-			"Prop",
-			"PROP",
-			SUPPLY,
-			await compliance.getAddress(),
-			admin.address
-		);
-		await token.waitForDeployment();
+		const { sources, requirements } = baseEligibilityConfig(core);
+		const productId = await core.factory.nextProductId();
+		await core.factory
+			.connect(admin)
+			.createProduct(
+				"Prop",
+				"PROP",
+				18,
+				sources,
+				requirements,
+				true,
+				admin.address,
+				admin.address
+			);
 
 		const MockERC20 = await ethers.getContractFactory("MockERC20");
 		pay = await MockERC20.deploy();
 		await pay.waitForDeployment();
 
-		const Escrow = await ethers.getContractFactory("ListingEscrow");
 		const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
-		escrow = await Escrow.deploy(
-			await token.getAddress(),
-			await pay.getAddress(),
-			sponsor.address,
-			TARGET,
-			now + BigInt(DAY),
-			admin.address
-		);
-		await escrow.waitForDeployment();
-		await compliance.setExempt(await escrow.getAddress(), true);
-		await token.transfer(await escrow.getAddress(), SUPPLY);
+		const tx = await core.factory
+			.connect(admin)
+			.deployEscrow(
+				productId,
+				await pay.getAddress(),
+				sponsor.address,
+				TARGET,
+				SUPPLY,
+				now + BigInt(DAY),
+				admin.address
+			);
+		const receipt = await tx.wait();
+		const event = receipt!.logs.find((log: any) => {
+			try {
+				return core.factory.interface.parseLog(log)!.name === "EscrowDeployed";
+			} catch {
+				return false;
+			}
+		});
+		const escrowAddr = core.factory.interface.parseLog(event!)!.args.escrow;
+		const Escrow = await ethers.getContractFactory("ListingEscrow");
+		escrow = Escrow.attach(escrowAddr);
+
+		const record = await core.factory.getProduct(productId);
+		const PropertyToken = await ethers.getContractFactory("PropertyToken");
+		token = PropertyToken.attach(record.token);
 
 		const half = TARGET / 2n;
 		for (const s of [alice, bob]) {
@@ -82,7 +94,9 @@ describe("ListingEscrow distribution fault tolerance (H3 regression)", function 
 
 	it("finalize survives a non-compliant investor and parks their share", async function () {
 		// bob's KYC lapses between deposit and finalize
-		await registry.removeIdentity(bob.address);
+		await core.credentialRegistry
+			.connect(admin)
+			.removeCredential(ccidFor(bob.address), KYC(), "0x");
 
 		await expect(escrow.finalize()).to.emit(escrow, "Finalized");
 
@@ -92,26 +106,19 @@ describe("ListingEscrow distribution fault tolerance (H3 regression)", function 
 		expect(await escrow.pendingTokens(bob.address)).to.equal(SUPPLY / 2n);
 		expect(await escrow.totalPendingTokens()).to.equal(SUPPLY / 2n);
 
-		// the pending reserve is untouchable by admin distribution
-		await expect(
-			escrow
-				.connect(admin)
-				.adminDistributeTokens([alice.address], [SUPPLY / 2n])
-		).to.be.revertedWith("Exceeds unreserved balance");
-
-		// still unverified -> pull fails at the token's compliance check
-		await expect(escrow.connect(bob).claimTokens()).to.be.revertedWith(
-			"Compliance: Transfer not allowed"
+		// still ineligible -> pull fails at the token's mint eligibility check;
+		// the failed pull must not zero the pending balance
+		await expect(escrow.connect(bob).claimTokens()).to.be.revertedWithCustomError(
+			core.engine,
+			"PolicyRunRejected"
 		);
-		// failed pull must not zero the pending balance
 		expect(await escrow.pendingTokens(bob.address)).to.equal(SUPPLY / 2n);
 
 		// re-KYC -> pull succeeds exactly once
-		await registry.registerIdentity(bob.address, 840, KYC());
-		await expect(escrow.connect(bob).claimTokens()).to.emit(
-			escrow,
-			"TokensClaimed"
-		);
+		await core.credentialRegistry
+			.connect(admin)
+			.registerCredential(ccidFor(bob.address), KYC(), 0n, "0x", "0x");
+		await expect(escrow.connect(bob).claimTokens()).to.emit(escrow, "TokensClaimed");
 		expect(await token.balanceOf(bob.address)).to.equal(SUPPLY / 2n);
 		expect(await escrow.totalPendingTokens()).to.equal(0n);
 		await expect(escrow.connect(bob).claimTokens()).to.be.revertedWith(

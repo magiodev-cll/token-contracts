@@ -39,18 +39,24 @@ const registry2 = getIdentityRegistryContract(provider);
 
 ## Architecture
 
-The system is four layers on an EVM chain (Arc by default), tied together by the
-compliance check that every token transfer routes through.
+The system is four layers on an EVM chain (Arbitrum One by default), tied
+together by the Chainlink ACE compliance stack: the `PolicyEngine` enforces
+eligibility, reject (sanctions) and admin policies on the token's and escrow's
+selectors.
 
 ```mermaid
 flowchart TD
-    subgraph Compliance
-      IR[IdentityRegistry] --> TC[TokenCompliance]
-      CE[ComplianceEnabled] -.-|_checkCompliance in _update| TC
+    subgraph Compliance["Chainlink ACE"]
+      PE[PolicyEngine]
+      IR[IdentityRegistry]
+      CR[CredentialRegistry]
+      RP[RejectPolicy]
+      WP[WriterPolicy]
+      WP -.gates.-> IR
+      WP -.gates.-> CR
     end
     subgraph Tokenization
       PF[PropertyFactory] --> PT[PropertyToken]
-      PT --> BPT[BridgedPropertyToken]
     end
     subgraph Finance
       LE[ListingEscrow]
@@ -61,40 +67,49 @@ flowchart TD
       SS[IdentitySyncSender] --> SR[IdentitySyncReceiver]
       NAV[PropertyNavConsumer]
     end
-    TC --> PT
+    PE -.policies.-> PT
+    PE -.policies.-> LE
+    PT -.eligibility.-> CR
     PF --> LE
     PT --> DV
     PT --> POOL
     SR --> IR
+    SR --> CR
     NAV -.NAV feed.-> DV
 ```
 
-### Compliance (`src/compliance/`)
+### Compliance (Chainlink ACE)
 
-- **IdentityRegistry** — role-based registry of KYC-verified investors
-  (`VERIFIED_ROLE`), with per-address country code and identity hash. Admin
-  registers/removes; a separate least-privilege `SYNC_ROLE` lets a cross-chain
-  receiver mirror KYC state (see [Cross-chain](#cross-chain-chainlink-ccip--cct)).
-- **TokenCompliance** — points at an `IdentityRegistry` and holds an exemption
-  list for infrastructure addresses (pools, escrows, vaults).
-- **ComplianceEnabled** — abstract base whose `_checkCompliance(from, to)` is
-  called from the token's `_update` hook. Standard transfers require **both**
-  ends verified-or-exempt; mints require the receiver verified-or-exempt; burns
-  are unrestricted.
+Compliance is not implemented in this repo anymore — it is the stock
+[Chainlink ACE](https://github.com/smartcontractkit/chainlink-ace) stack
+(`@chainlink/ace@1.2.0`):
+
+- **`PolicyEngine`** — the shared rule engine; policies are attached per
+  selector (eligibility, reject/sanctions, admin) and can be changed without
+  redeploying the protected contracts.
+- **`IdentityRegistry` + `CredentialRegistry`** — wallet → CCID mapping and
+  credentials (KYC/AML/accredited) with expiry. Mutations are governed by an
+  `OnlyAuthorizedSenderPolicy` writer policy; issuers are authorized by adding
+  their address to it.
+- **Policies** — stock only: `OnlyAuthorizedSenderPolicy` (registry writes,
+  token admin/mint), `CredentialRegistryIdentityValidatorPolicy` (eligibility:
+  KYC + AML, optionally accredited), `RejectPolicy` (sanctions denylist).
+- **Onboarding** — an authorized issuer calls the registries directly
+  (the ACE advanced getting-started pattern); CCID = `bytes32(uint160(wallet))`.
 
 ### Tokenization (`src/tokenization/`)
 
-- **PropertyToken** — ERC-20 (+ ERC-2612 Permit) representing fractional
-  ownership of a property. Compliance-gated on every balance change, with a
-  snapshot mechanism used for dividend distribution and a `getCCIPAdmin()` hook
-  for Chainlink CCT registration.
-- **BridgedPropertyToken** — destination-chain variant deployed with zero
-  supply. Implements the `IBurnMintERC20` surface for CCIP pools and uses
-  **mint-and-freeze**: a bridge mint always delivers (so CCIP's OffRamp sees the
-  exact receiver balance delta), but the tokens are non-transferable until the
-  holder is KYC-verified.
-- **PropertyFactory** — deploys `PropertyToken` + `ListingEscrow` pairs and
-  tracks them.
+- **PropertyToken** — stock ACE `ComplianceTokenERC3643` (UUPS, policy-protected)
+  plus the snapshot mechanism used for dividend distribution and the funds
+  vault (`withdrawFunds`). Compliance is enforced by ACE policies on
+  mint/transfer/transferFrom, not by contract code; `burn(uint256)`/`burnFrom`
+  provide the `IBurnMintERC20` surface for CCIP pools, and `getCCIPAdmin()` the
+  CCT registration hook. Mint-and-freeze bridging is preserved via
+  `mintRequiresEligibility=false` products: a bridge mint always delivers, but
+  transfers stay eligibility-gated.
+- **PropertyFactory** — deploys each listing's token plus its product policies
+  (eligibility, reject, admin) and escrows; shared implementations are deployed
+  once and proxied per product.
 
 ### Finance (`src/finance/`)
 
@@ -145,7 +160,7 @@ flowchart TD
 
 | Product | Where | What it does |
 |---|---|---|
-| **CCT** (Cross-Chain Token) | `BridgedPropertyToken`, `PropertyToken.getCCIPAdmin()` | Self-serve `TokenAdminRegistry` registration; `IBurnMintERC20` surface |
+| **CCT** (Cross-Chain Token) | `PropertyToken.getCCIPAdmin()`, `burn`/`burnFrom` | Self-serve `TokenAdminRegistry` registration; `IBurnMintERC20` surface |
 | **CCIP** | `CompliantPropertyTokenPool`, `IdentitySync{Sender,Receiver}` | Burn/mint bridging with source-side compliance gating + cross-chain KYC identity sync |
 | **CRE** | `src/oracle/`, `cre/` | Property-NAV oracle: consensus-aggregated valuation written on-chain |
 
@@ -158,10 +173,10 @@ Arbitrum One is the target home chain for production; Arbitrum Sepolia is its
 staging mirror. Both Chainlink integrations are code-complete and tested, but
 they activate in phases:
 
-1. **Core protocol on Arbitrum** — compliance (`IdentityRegistry`,
-   `TokenCompliance`), tokenization (`PropertyFactory` → `PropertyToken`), and
-   finance (`ListingEscrow`, `DividendVault`) via `pnpm deploy:arbitrum-sepolia`
-   / `deploy:arbitrum-one`. USDC is Circle-native on both networks.
+1. **Core protocol on Arbitrum** — the ACE core (`PolicyEngine`, registries,
+   policies, `PropertyFactory`) plus finance (`ListingEscrow`, `DividendVault`)
+   via `pnpm deploy:arbitrum-sepolia` / `deploy:arbitrum-one`. USDC is
+   Circle-native on both networks.
 2. **Pricing oracles via CRE (current focus).** The platform has no on-chain
    pricing oracles today; the first Chainlink integration to go live is the
    property-NAV oracle: deploy `PropertyNavConsumer` with the chain's
@@ -174,14 +189,15 @@ they activate in phases:
    once a second chain is in play. Not part of the initial Arbitrum rollout.
 
 **Topology invariant (bridged lanes).** Source-side gating is only sound if
-every chain a token bridges to is mint-and-freeze. Satellite chains deploy
-`BridgedPropertyToken`; if a lane will bridge *into* the home chain, the home
-token must also be the role-based `BridgedPropertyToken` variant (deploy with
-zero supply, then mint the initial supply under a temporary `MINTER_ROLE`) —
-a plain `PropertyToken` cannot mint inbound deliveries and would strand
-burned tokens whenever the receiver is unverified. `scripts/ccip-register.ts`
-verifies the role/pool linkage per lane and warns when a token is not
-bridge-capable.
+every chain a token bridges to is mint-and-freeze. Every listing uses the same
+ACE `PropertyToken`; bridged products are created with
+`mintRequiresEligibility=false` so the pool's inbound mints always deliver
+(CCIP's OffRamp needs the exact receiver balance delta), while transfers stay
+eligibility-gated — an unverified receiver holds but cannot move tokens. The
+CCIP pool is authorized as a minter on the product's mint policy
+(`authorizeMinter`); source-side gating checks the product's eligibility policy
+in `lockOrBurn`. `scripts/ccip-register.ts` verifies the policy/pool linkage
+per lane and warns when a token is not bridge-capable.
 
 ## Security model
 
@@ -274,19 +290,21 @@ Production deploys target Arbitrum One (`pnpm deploy:arbitrum-one`) per the
 > Note: `test/TestnetValidation.ts` self-skips (via `process.exit(0)`) when no
 > `deployment.default.json` is present, which ends the whole `hardhat test` run
 > early. Run the unit suites explicitly, e.g.
-> `hardhat test test/SmokeTest.ts test/CCIPCompliantPool.ts test/IdentitySync.ts test/PropertyNavOracle.ts test/PropertyTokenSnapshot.ts test/ListingEscrowRefund.ts test/ListingEscrowDistribution.ts test/DividendVault.ts`.
+> `hardhat test test/SmokeTest.ts test/PropertyTokenSnapshot.ts test/ListingEscrowRefund.ts test/ListingEscrowDistribution.ts test/DividendVault.ts test/PropertyNavOracle.ts`.
+> `IdentitySync` and `CCIPCompliantPool` are being ported to the ACE stack and
+> are re-enabled as they land.
 
 ## Exports
 
 **Config (resolved at import):** `NETWORK`, `CHAIN_ID`, `CURRENCY`, `RPC_URL`,
 `BLOCK_EXPLORER_URL`, `CONTRACTS`, `Deployment`, `USDC_ADDRESS`.
 
-**ABIs:** `ABIS` (`IdentityRegistry`, `Compliance`, `USDC`, `DividendVault`,
+**ABIs:** `ABIS` (`IdentityRegistry`, `USDC`, `DividendVault`,
 `PropertyFactory`, `PropertyToken`, `ListingEscrow`, `IdentitySyncSender`,
 `PropertyNavConsumer`), plus `ListingEscrowAbi` and `ErrorStringAbi`.
 
 **Contract helpers.** Singletons read their address from the active deployment
-and take just a runner: `getIdentityRegistryContract`, `getComplianceContract`,
+and take just a runner: `getIdentityRegistryContract`,
 `getUSDCContract`, `getDividendVaultContract`, `getPropertyFactoryContract`.
 Per-listing / per-chain contracts take an explicit address:
 `getPropertyTokenContract(address, runner)` (alias `getTokenContract`),
@@ -295,8 +313,9 @@ Per-listing / per-chain contracts take an explicit address:
 `getPropertyNavConsumerContract(address, runner)`.
 
 Full artifacts (ABI + bytecode) for backend deployment are exported as
-`IdentityRegistryArtifact`, `TokenComplianceArtifact`, `IdentitySyncSenderArtifact`,
-and `PropertyNavConsumerArtifact`.
+`IdentitySyncSenderArtifact` and `PropertyNavConsumerArtifact`. ACE core
+contracts deploy through the build-info based tooling in
+`scripts/lib/ace-core.ts`.
 
 ## License
 

@@ -1,9 +1,12 @@
 import { expect } from "chai";
 import hre from "hardhat";
+import {
+	ethers,
+	deployAceCore,
+	onboard,
+	baseEligibilityConfig,
+} from "./helpers/ace";
 
-const { ethers } = await hre.network.connect();
-
-const KYC = () => ethers.keccak256(ethers.toUtf8Bytes("KYC"));
 const DAY = 24 * 60 * 60;
 
 // Regression tests for the escrow refund brick (audit H4): refund() must not be
@@ -14,62 +17,65 @@ describe("ListingEscrow refund gating (H4 regression)", function () {
 	let sponsor: any;
 	let alice: any;
 	let bob: any;
-	let registry: any;
-	let compliance: any;
+	let core: any;
 	let token: any;
 	let pay: any;
 
 	const TARGET = ethers.parseUnits("1000", 18);
 	const SUPPLY = ethers.parseUnits("1000", 18);
+	let productId: bigint;
 
 	async function deployEscrow(deadlineOffset: number) {
-		const Escrow = await ethers.getContractFactory("ListingEscrow");
 		const now = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
-		const escrow = await Escrow.deploy(
-			await token.getAddress(),
-			await pay.getAddress(),
-			sponsor.address,
-			TARGET,
-			now + BigInt(deadlineOffset),
-			admin.address
-		);
-		await escrow.waitForDeployment();
-		// Escrow must be compliance-exempt to hold/move the property token.
-		await compliance.setExempt(await escrow.getAddress(), true);
-		// Fund the escrow with the full token supply to distribute on finalize.
-		await token.transfer(await escrow.getAddress(), SUPPLY);
-		return escrow;
+		const tx = await core.factory
+			.connect(admin)
+			.deployEscrow(
+				productId,
+				await pay.getAddress(),
+				sponsor.address,
+				TARGET,
+				SUPPLY,
+				now + BigInt(deadlineOffset),
+				admin.address
+			);
+		const receipt = await tx.wait();
+		const event = receipt!.logs.find((log: any) => {
+			try {
+				return core.factory.interface.parseLog(log)!.name === "EscrowDeployed";
+			} catch {
+				return false;
+			}
+		});
+		const escrowAddr = core.factory.interface.parseLog(event!)!.args.escrow;
+		const Escrow = await ethers.getContractFactory("ListingEscrow");
+		return Escrow.attach(escrowAddr);
 	}
 
 	beforeEach(async function () {
 		[admin, sponsor, alice, bob] = await ethers.getSigners();
+		core = await deployAceCore(admin);
 
-		const IdentityRegistry =
-			await ethers.getContractFactory("IdentityRegistry");
-		registry = await IdentityRegistry.deploy(admin.address);
-		await registry.waitForDeployment();
+		await onboard(core, admin, alice);
+		await onboard(core, admin, bob);
 
-		const TokenCompliance =
-			await ethers.getContractFactory("TokenCompliance");
-		compliance = await TokenCompliance.deploy(
-			await registry.getAddress(),
-			admin.address
-		);
-		await compliance.waitForDeployment();
+		const { sources, requirements } = baseEligibilityConfig(core);
+		productId = await core.factory.nextProductId();
+		await core.factory
+			.connect(admin)
+			.createProduct(
+				"Prop",
+				"PROP",
+				18,
+				sources,
+				requirements,
+				true,
+				admin.address,
+				admin.address
+			);
 
-		for (const s of [admin, alice, bob]) {
-			await registry.registerIdentity(s.address, 840, KYC());
-		}
-
+		const record = await core.factory.getProduct(productId);
 		const PropertyToken = await ethers.getContractFactory("PropertyToken");
-		token = await PropertyToken.deploy(
-			"Prop",
-			"PROP",
-			SUPPLY,
-			await compliance.getAddress(),
-			admin.address
-		);
-		await token.waitForDeployment();
+		token = PropertyToken.attach(record.token);
 
 		const MockERC20 = await ethers.getContractFactory("MockERC20");
 		pay = await MockERC20.deploy();

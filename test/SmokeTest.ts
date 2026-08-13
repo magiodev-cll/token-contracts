@@ -12,6 +12,7 @@ describe("Commertize ACE Contracts Suite", function () {
 	let core: any;
 	let propertyToken: any;
 	let escrow: any;
+	let productId: bigint;
 
 	before(async function () {
 		[admin, agent, user, sponsor] = await ethers.getSigners();
@@ -54,7 +55,7 @@ describe("Commertize ACE Contracts Suite", function () {
 		await onboard(core, admin, user);
 
 		const { sources, requirements } = baseEligibilityConfig(core);
-		const productId = await core.factory.nextProductId();
+		productId = await core.factory.nextProductId();
 		await core.factory
 			.connect(admin)
 			.createProduct(
@@ -136,5 +137,86 @@ describe("Commertize ACE Contracts Suite", function () {
 		// an eligible investor can
 		await escrowC.connect(user).deposit(0n, { value: 2000n });
 		expect(await escrowC.totalRaised()).to.equal(2000n);
+	});
+
+	it("depositFor is gated through the account extractor", async function () {
+		const Escrow = await ethers.getContractFactory("ListingEscrow");
+		const escrowC = Escrow.attach(escrow);
+
+		// depositFor pulls payment tokens from the investor, so this path uses
+		// a payment token escrow; the "account" param drives the policy check
+		const MockERC20 = await ethers.getContractFactory("MockERC20");
+		const pay = await MockERC20.deploy();
+		await pay.waitForDeployment();
+		const now = Math.floor(Date.now() / 1000) + 3600;
+		const tx = await core.factory
+			.connect(admin)
+			.deployEscrow(
+				productId,
+				await pay.getAddress(),
+				sponsor.address,
+				ethers.parseEther("1"),
+				ethers.parseEther("1000"),
+				now,
+				admin.address
+			);
+		const receipt = await tx.wait();
+		const event = receipt!.logs.find((log: any) => {
+			try {
+				return core.factory.interface.parseLog(log)!.name === "EscrowDeployed";
+			} catch {
+				return false;
+			}
+		});
+		const escrowAddr = core.factory.interface.parseLog(event!)!.args.escrow;
+		const escrowC2 = Escrow.attach(escrowAddr);
+
+		await pay.mint(user.address, 1000000n);
+		await pay.connect(user).approve(escrowAddr, 1000000n);
+
+		// un-onboarded investor blocked via the account param
+		await pay.mint(agent.address, 1000000n);
+		await pay.connect(agent).approve(escrowAddr, 1000000n);
+		await expect(
+			escrowC2.connect(admin).depositFor(agent.address, 2000n)
+		).to.be.revertedWithCustomError(core.engine, "PolicyRunRejected");
+
+		// eligible investor succeeds
+		await escrowC2.connect(admin).depositFor(user.address, 2000n);
+		expect(await escrowC2.totalRaised()).to.equal(2000n);
+	});
+
+	it("expired credentials fail eligibility", async function () {
+		// bob with KYC/AML expiring momentarily cannot be minted to or deposit
+		const bob = (await ethers.getSigners())[4];
+		const { sources, requirements } = baseEligibilityConfig(core);
+		const productId2 = await core.factory.nextProductId();
+		await core.factory
+			.connect(admin)
+			.createProduct(
+				"Expiry Prop",
+				"EXP",
+				18,
+				sources,
+				requirements,
+				true,
+				admin.address,
+				admin.address
+			);
+		const record2 = await core.factory.getProduct(productId2);
+		const PropertyToken = await ethers.getContractFactory("PropertyToken");
+		const token2 = PropertyToken.attach(record2.token);
+
+		await onboard(core, admin, bob, {
+			expiresAt: BigInt(Math.floor(Date.now() / 1000) + 60),
+		});
+		await token2.connect(admin).mint(bob.address, 10n);
+		await ethers.provider.send("evm_increaseTime", [120]);
+		await ethers.provider.send("evm_mine", []);
+
+		// mint to the now-expired investor reverts via the eligibility policy
+		await expect(
+			token2.connect(admin).mint(bob.address, 10n)
+		).to.be.revertedWithCustomError(core.engine, "PolicyRunRejected");
 	});
 });
