@@ -7,56 +7,88 @@
 // │  PURPOSES ONLY. IT IS NOT SUITABLE FOR PRODUCTION USE, AND IT MUST NOT BE │
 // │  USED TO HOLD OR MOVE ANY ASSET OF VALUE.                                 │
 // └───────────────────────────────────────────────────────────────────────────┘
-// Configures the deployed ACE stack through the Coordinator API instead of raw
-// onchain calls: extractor registration + engine association, target
-// registration, and policy protections. Mirrors what deployAceCore wires
-// onchain for tests; in production the control plane is the system of record.
+// Creates and wires the whole ACE-owned surface through the Coordinator API
+// (per scripts/ace-api-docs/ace-coordinator-api-doc.json):
 //
-// Usage (after scripts/deploy.ts filled the manifest addresses; hardhat run
-// takes no positional args, so the command and confirmations are env-driven):
-//   pnpm config-ace:validate              # offline manifest check
+//   extractors -> policy engine -> registries -> policy implementations ->
+//   policy instances -> targets -> protections
+//
+// Everything ACE is API-managed here. Commertize's own infra contracts are
+// deployed by scripts/deploy.ts (extractors/implementations/factory/tokens)
+// and only registered + configured through this script.
+//
+// Hardhat `run` takes no positional args, so the command and confirmations
+// are env-driven:
+//   pnpm config-ace:validate
 //   pnpm config-ace:plan -- --network sepolia
-//   ACE_CONFIG_COMMAND=apply ACE_CONFIG_CONFIRM_POLICY_ENGINE=<addr> \
-//     ACE_CONFIG_CONFIRM_CHAIN_ID=<id> pnpm config-ace:apply -- --network sepolia
+//   ACE_CONFIG_COMMAND=apply ACE_CONFIG_CONFIRM_CHAIN_SELECTOR=<sel> pnpm config-ace:apply -- --network sepolia
 //   pnpm config-ace:verify -- --network sepolia
+import fs from "node:fs";
 import path from "node:path";
 import {
 	AceApi,
 	DEFAULT_MANIFEST,
-	findPolicyEngine,
 	invariant,
 	isAddress,
 	loadDotEnv,
-	manifestReference,
 	readJson,
-	requireApplyConfirmation,
-	sameStrings,
+	statusOf,
 	verifyApiNetwork,
+	waitForStatus,
 } from "./lib/ace-api";
 import { contractAt, sel } from "./lib/ace-core";
 
+const ZERO = `0x${"0".repeat(40)}`;
 const command = process.env.ACE_CONFIG_COMMAND ?? "validate";
 invariant(["validate", "plan", "apply", "verify"].includes(command), `Unknown ACE_CONFIG_COMMAND: ${command}`);
 const flags = {
 	manifest: process.env.ACE_CONFIG_MANIFEST ?? "",
-	"confirm-policy-engine": process.env.ACE_CONFIG_CONFIRM_POLICY_ENGINE ?? "",
-	"confirm-chain-id": process.env.ACE_CONFIG_CONFIRM_CHAIN_ID ?? "",
+	"confirm-chain-selector": process.env.ACE_CONFIG_CONFIRM_CHAIN_SELECTOR ?? "",
 };
 const manifestFile = path.resolve(flags.manifest || DEFAULT_MANIFEST);
 const manifest: any = await readJson(manifestFile);
+const CHAIN = String(manifest.coordinatorApi.chainSelector);
 
-function targetDefaultAllow(value: unknown) {
-	if (typeof value === "boolean") return value;
-	if (value === "allow") return true;
-	if (value === "deny") return false;
-	return null;
+function resolvedAddress(reference: string) {
+	const value = reference.split(".").reduce((node: any, key: string) => node?.[key], manifest);
+	invariant(isAddress(value) && value !== ZERO, `${reference} is not filled in the manifest`);
+	return value;
 }
 
-function desiredExtractors() {
-	invariant(manifest.schemaVersion === 1, "Unsupported manifest schemaVersion");
-	invariant(isAddress(manifest.inputs?.policyEngine), "Manifest PolicyEngine is invalid");
-	invariant(Array.isArray(manifest.extractors) && manifest.extractors.length > 0, "Manifest extractors are empty");
+function recordByOnchain(records: any[], address: string, field: string) {
+	return records.find(
+		(record: any) =>
+			record.archived_at == null &&
+			(record[field] ?? []).some(
+				(onchain: any) =>
+					String(onchain.chain_selector) === CHAIN && onchain.address?.toLowerCase() === address.toLowerCase()
+			)
+	) ?? null;
+}
 
+function recordByName(records: any[], name: string) {
+	return records.find((record: any) => record.archived_at == null && record.name === name) ?? null;
+}
+
+function applyLog(method: string, pathname: string, label: string, body?: unknown) {
+	console.log(`${command === "apply" ? "APPLY" : "PLAN "} ${method} ${pathname} - ${label}`);
+	if (command !== "apply" && body !== undefined) console.log(JSON.stringify(body, null, 2));
+}
+
+async function runWrite(method: string, pathname: string, body: unknown, label: string, api: AceApi) {
+	applyLog(method, pathname, label, body);
+	if (command !== "apply") return null;
+	return method === "POST" ? api.post(pathname, body) : api.put(pathname, body);
+}
+
+// ── Manifest validation (offline) ────────────────────────────────────────────
+function validateManifest() {
+	invariant(manifest.schemaVersion === 2, "Unsupported manifest schemaVersion");
+	invariant(isAddress(manifest.inputs?.deployer), "inputs.deployer is missing");
+	invariant(manifest.coordinatorApi.baseUrl, "coordinatorApi.baseUrl is missing");
+	invariant(CHAIN, "coordinatorApi.chainSelector is missing");
+
+	invariant(manifest.extractors?.length > 0, "extractors are empty");
 	for (const [label, values] of [
 		["ids", manifest.extractors.map((item: any) => item.id)],
 		["names", manifest.extractors.map((item: any) => item.name)],
@@ -64,222 +96,266 @@ function desiredExtractors() {
 	]) {
 		invariant(new Set(values).size === manifest.extractors.length, `Extractor ${label} must be unique`);
 	}
-	const realAddresses = manifest.extractors
-		.map((item: any) => item.address.toLowerCase())
-		.filter((address: string) => address !== `0x${"0".repeat(40)}`);
-	invariant(new Set(realAddresses).size === realAddresses.length, "Extractor addresses must be unique");
-	return manifest.extractors.map((item: any) => {
-		invariant(isAddress(item.address), `${item.id}: extractor address is invalid`);
-		invariant(/^0x[0-9a-fA-F]{8}$/.test(item.selector), `${item.id}: selector is invalid`);
-		invariant(item.signatures?.length > 0, `${item.id}: supported signatures are missing`);
-		invariant(item.outputs?.length > 0, `${item.id}: extractor outputs are missing`);
-		return {
-			...item,
-			payload: {
-				name: item.name,
-				supported_function_signatures: item.signatures,
-				outputs: item.outputs,
-				onchain_extractors: [
-					{
-						chain_selector: String(manifest.coordinatorApi.chainSelector),
-						address: item.address,
-					},
-				],
-			},
-		};
-	});
-}
-
-function metadataMatches(remote: any, desired: any) {
-	const signatures = remote.supported_function_signatures ?? [];
-	const outputs = (remote.outputs ?? []).map(({ name, type }: any) => ({ name, type }));
-	return (
-		remote.name === desired.name &&
-		sameStrings(signatures, desired.signatures) &&
-		JSON.stringify(outputs) === JSON.stringify(desired.outputs)
-	);
-}
-
-function classifyExtractors(remoteExtractors: any[], desired: any[]) {
-	const matches = new Map();
-	const missing: any[] = [];
-	const updates: any[] = [];
-	for (const item of desired) {
-		const active = remoteExtractors.filter((remote) => remote.archived_at == null);
-		const addressMatches = active.filter((remote) =>
-			(remote.onchain_extractors ?? []).some(
-				(onchain: any) =>
-					String(onchain.chain_selector) === String(manifest.coordinatorApi.chainSelector) &&
-					onchain.address?.toLowerCase() === item.address.toLowerCase()
-			)
-		);
-		invariant(addressMatches.length <= 1, `${item.id}: multiple extractor records use ${item.address}`);
-		if (addressMatches.length === 1) {
-			invariant(metadataMatches(addressMatches[0], item), `${item.id}: existing extractor metadata does not match`);
-			matches.set(item.id, addressMatches[0]);
-			continue;
-		}
-		const nameMatches = active.filter((remote) => remote.name === item.name);
-		invariant(nameMatches.length <= 1, `${item.id}: multiple extractor records use the same name`);
-		if (nameMatches.length === 1) {
-			const remote = nameMatches[0];
-			invariant(metadataMatches(remote, item), `${item.id}: existing extractor metadata does not match`);
-			const currentChain = (remote.onchain_extractors ?? []).filter(
-				(onchain: any) => String(onchain.chain_selector) === String(manifest.coordinatorApi.chainSelector)
-			);
-			invariant(currentChain.length === 0, `${item.id}: this chain is already registered with a different address`);
-			const signatureConflicts = active.filter(
-				(candidate) => candidate.id !== remote.id && (candidate.supported_function_signatures ?? []).some((s: string) => item.signatures.includes(s))
-			);
-			invariant(signatureConflicts.length === 0, `${item.id}: extractor signature exists on another record`);
-			updates.push({ remote, desired: item });
-			continue;
-		}
-		const signatureConflicts = active.filter((remote) =>
-			(remote.supported_function_signatures ?? []).some((s: string) => item.signatures.includes(s))
-		);
-		invariant(signatureConflicts.length === 0, `${item.id}: extractor signature already exists under another name`);
-		missing.push(item);
+	for (const item of manifest.extractors) {
+		invariant(item.signatures?.length > 0, `${item.id}: signatures are missing`);
+		invariant(item.outputs?.length > 0, `${item.id}: outputs are missing`);
 	}
-	return { matches, missing, updates };
+
+	invariant(manifest.policyImplementations?.length > 0, "policyImplementations are empty");
+	for (const item of manifest.policyImplementations) {
+		invariant(isAddress(item.address), `${item.id}: implementation address is missing (run deploy.ts first)`);
+		invariant(item.configSchema?.properties, `${item.id}: configSchema is missing (fill from the platform)`);
+	}
+
+	const policiesById = new Map(manifest.policies.map((policy: any) => [policy.id, policy]));
+	invariant(manifest.policies?.length > 0, "policies are empty");
+	for (const policy of manifest.policies) {
+		invariant(policiesById.has(policy.id), `${policy.id}: duplicate policy id`);
+		const impl = manifest.policyImplementations.find((item: any) => item.id === policy.implementation);
+		invariant(impl, `${policy.id}: unknown implementation ${policy.implementation}`);
+		invariant(isAddress(impl.address), `${policy.id}: implementation ${policy.implementation} not deployed`);
+	}
+
+	invariant(manifest.targets?.length > 0, "targets are empty");
+	for (const target of manifest.targets) {
+		invariant(manifest.registries[target.registry], `${target.id}: unknown registry ${target.registry}`);
+		invariant(target.entrypoints?.length > 0, `${target.id}: entrypoints are missing`);
+		for (const step of target.policyChain ?? []) {
+			invariant(policiesById.has(step.policy), `${target.id}: unknown policy ${step.policy}`);
+			invariant(Array.isArray(step.parameters), `${target.id}: parameters must be an array`);
+		}
+	}
+	console.log(`VALID  ${manifest.extractors.length} extractors, ${manifest.policyImplementations.length} implementations, ${manifest.policies.length} policies, ${manifest.targets.length} targets`);
+	console.log("OK     manifest is internally consistent (offline check)");
 }
 
-function desiredTargets() {
-	const defaultAllow = targetDefaultAllow(manifest.inputs.finalTargetBehavior);
-	invariant(defaultAllow !== null, "inputs.finalTargetBehavior must be true/false or allow/deny");
-	const targets: any[] = [];
-	for (const target of manifest.targets ?? []) {
-		const validatorAddress = manifestReference(manifest, target.validatorAddress);
-		invariant(isAddress(validatorAddress), `${target.id}: validatorAddress is missing`);
-		for (const policy of target.policyChain ?? []) {
-			const policyAddress = manifestReference(manifest, policy.policyReference);
-			invariant(isAddress(policyAddress), `${target.id}: ${policy.policyReference} is missing`);
+// ── Resource reconciliation + requests ───────────────────────────────────────
+async function extractorRequests(api: AceApi) {
+	const remote = await api.list("/extractors", "extractors", { include_onchains: true });
+	const requests: { method: string; path: string; body: any; label: string; target: any }[] = [];
+	for (const item of manifest.extractors) {
+		const byAddress = recordByOnchain(remote, item.address, "onchain_extractors");
+		if (byAddress) {
+			item.uuid = byAddress.id;
+			item.converged = true;
+			continue;
 		}
-		targets.push({
-			...target,
-			validatorAddress,
-			payload: {
-				title: target.id,
-				description: `Commertize ACE target for ${target.entrypoints.join(", ")}`,
-				policy_engine_id: null,
-				protected_methods: target.entrypoints,
-				onchain_targets: [
-					{
-						chain_selector: String(manifest.coordinatorApi.chainSelector),
-						address: validatorAddress,
-					},
-				],
-				desired_default_allow: defaultAllow,
-			},
+		const byName = recordByName(remote, item.name);
+		if (byName && byName.archived_at == null) {
+			const onchain = [...(byName.onchain_extractors ?? [])].map((r: any) => ({
+				chain_selector: String(r.chain_selector),
+				address: r.address,
+			}));
+			onchain.push({ chain_selector: CHAIN, address: item.address });
+			item.uuid = byName.id;
+			requests.push({
+				method: "PUT",
+				path: `/extractors/${byName.id}`,
+				body: { name: item.name, supported_function_signatures: item.signatures, outputs: item.outputs, onchain_extractors: onchain },
+				label: `add ${manifest.network.name} address to ${item.name}`,
+				target: item,
+			});
+			continue;
+		}
+		requests.push({
+			method: "POST",
+			path: "/extractors",
+			body: { name: item.name, supported_function_signatures: item.signatures, outputs: item.outputs, onchain_extractors: [{ chain_selector: CHAIN, address: item.address }] },
+			label: `register ${item.name}`,
+			target: item,
 		});
 	}
-	return { defaultAllow, targets };
+	return requests;
 }
 
-function findOnchainRecord(records: any[], chainSelector: string, address: string, field: string) {
-	const matches = records.filter(
-		(record) =>
-			record.archived_at == null &&
-			(record[field] ?? []).some(
-				(onchain: any) =>
-					String(onchain.chain_selector) === chainSelector &&
-					onchain.address?.toLowerCase() === address.toLowerCase()
-			)
+async function engineRequests(api: AceApi, extractorUuids: string[]) {
+	const remote = await api.list("/policy-engines", "policy_engines", { include_onchains: true });
+	const existing = remote.find(
+		(engine: any) => engine.archived_at == null && String(engine.name) === manifest.engine.name
 	);
-	invariant(matches.length <= 1, `Multiple API records found for ${address}`);
-	return matches[0] ?? null;
+	if (existing) {
+		const chainSelectors = (existing.onchain_policy_engines ?? []).map((r: any) => String(r.chain_selector));
+		const missingAssociation = extractorUuids.some((uuid) => !(existing.extractor_registrations ?? []).some((r: any) => r.id === uuid));
+		const requests = missingAssociation
+			? [{
+				method: "PUT",
+				path: `/policy-engines/${existing.id}`,
+				body: {
+					name: existing.name,
+					onchain_policy_engines: [...new Set(chainSelectors)].map((chain_selector) => ({ chain_selector })),
+					extractor_ids: [...new Set([...(existing.extractor_registrations ?? []).map((r: any) => r.id), ...extractorUuids])],
+				},
+				label: "associate extractors with the existing PolicyEngine",
+				target: existing,
+			}]
+			: [];
+		return { engine: existing, requests };
+	}
+	const body = {
+		name: manifest.engine.name,
+		description: manifest.engine.description,
+		extractor_ids: extractorUuids,
+		onchain_policy_engines: [{ chain_selector: CHAIN }],
+	};
+	return { engine: null, requests: [{ method: "POST", path: "/policy-engines", body, label: `deploy ${manifest.engine.name}`, target: null }] };
 }
 
-async function resolvePolicies(api: AceApi, engine: any, addresses: string[]) {
-	const policies = await api.list("/policies", "policies", {
-		include_onchains: true,
-		policy_engine_id: engine.id,
-	});
-	return new Map(
-		addresses.map((address) => {
-			const policy = findOnchainRecord(
-				policies,
-				String(manifest.coordinatorApi.chainSelector),
-				address,
-				"onchain_policies"
-			);
-			invariant(policy, `Policy instance ${address} is not registered in the ACE API`);
-			invariant(policy.policy_engine_id === engine.id, `Policy instance ${address} uses another PolicyEngine`);
-			const onchain = (policy.onchain_policies ?? []).find(
-				(record: any) => String(record.chain_selector) === String(manifest.coordinatorApi.chainSelector)
-			);
-			invariant(onchain?.status === "created", `Policy instance ${address} is not created onchain`);
-			invariant(onchain.out_of_sync !== true, `Policy instance ${address} is out of sync`);
-			return [address.toLowerCase(), policy];
-		})
-	);
-}
-
-async function targetState(api: AceApi, engine: any, desired: any) {
-	const targets = await api.list("/targets", "targets", {
-		include_onchains: true,
-		policy_engine_id: engine.id,
-		chain_selector: String(manifest.coordinatorApi.chainSelector),
-	});
-	const matches = new Map();
-	const missing: any[] = [];
-	for (const item of desired.targets) {
-		const target = findOnchainRecord(
-			targets,
-			String(manifest.coordinatorApi.chainSelector),
-			item.validatorAddress,
-			"onchain_targets"
-		);
-		if (!target) {
-			missing.push(item);
+async function registryRequests(api: AceApi) {
+	const remote = await api.list("/registries", "registries", { include_onchains: true });
+	const requests: any[] = [];
+	for (const [id, spec] of Object.entries(manifest.registries)) {
+		const existing = recordByName(remote, spec.name);
+		if (existing) {
+			spec.uuid = existing.id;
+			spec.converged = true;
 			continue;
 		}
-		invariant(target.policy_engine_id === engine.id, `${item.id}: target uses another PolicyEngine`);
-		invariant(
-			sameStrings(target.protected_methods ?? [], item.entrypoints),
-			`${item.id}: protected methods mismatch`
-		);
-		invariant(target.desired_default_allow === desired.defaultAllow, `${item.id}: target default mismatch`);
-		matches.set(item.id, target);
+		requests.push({
+			method: "POST",
+			path: "/registries",
+			body: {
+				name: spec.name,
+				description: spec.description,
+				identity_registries: id === "identityRegistry"
+					? [{ name: spec.name, chain_selector: CHAIN, description: spec.description }]
+					: [],
+				credential_registries: id === "credentialRegistry"
+					? [{ name: spec.name, chain_selector: CHAIN, description: spec.description }]
+					: [],
+			},
+			label: `deploy ${spec.name}`,
+			target: id,
+		});
 	}
-	return { matches, missing };
+	return requests;
 }
 
-async function protectionRequests(api: AceApi, desired: any, targets: Map<string, any>, policies: Map<string, any>) {
+async function implementationRequests(api: AceApi) {
+	const remote = await api.list("/policy-implementations", "policy_implementations", { include_onchains: true });
 	const requests: any[] = [];
-	for (const item of desired.targets) {
-		const target = targets.get(item.id);
-		invariant(target, `${item.id}: target registration did not converge`);
-		const existing = await api.list(`/targets/${target.id}/protections`, "target_protections", {
+	for (const item of manifest.policyImplementations) {
+		const existing = recordByOnchain(remote, item.address, "onchain_policy_implementations");
+		if (existing) {
+			item.uuid = existing.id;
+			item.converged = true;
+			continue;
+		}
+		requests.push({
+			method: "POST",
+			path: "/policy-implementations",
+			body: {
+				name: item.name,
+				description: item.description ?? `Commertize ${item.name} implementation`,
+				policy_config_schema: item.configSchema,
+				onchain_policy_implementations: [{ chain_selector: CHAIN, address: item.address }],
+			},
+			label: `register ${item.name}`,
+			target: item,
+		});
+	}
+	return requests;
+}
+
+async function policyRequests(api: AceApi, engineUuid: string) {
+	const remote = await api.list("/policies", "policies", {
+		include_onchains: true,
+		policy_engine_id: engineUuid,
+	});
+	const requests: any[] = [];
+	for (const policy of manifest.policies) {
+		const existing = remote.find(
+			(r: any) => r.archived_at == null && r.name === policy.name && r.policy_engine_id === engineUuid
+		);
+		if (existing) {
+			policy.uuid = existing.id;
+			policy.converged = true;
+			continue;
+		}
+		const impl = manifest.policyImplementations.find((item: any) => item.id === policy.implementation);
+		invariant(impl.uuid, `${policy.id}: implementation ${policy.implementation} has no UUID yet`);
+		requests.push({
+			method: "POST",
+			path: "/policies",
+			body: {
+				name: policy.name,
+				description: policy.description ?? `Commertize ${policy.id} policy`,
+				policy_implementation_id: impl.uuid,
+				policy_engine_id: engineUuid,
+				onchain_policies: [{ chain_selector: CHAIN, initial_config: policy.initialConfig }],
+			},
+			label: `create ${policy.name}`,
+			target: policy,
+		});
+	}
+	return requests;
+}
+
+async function targetRequests(api: AceApi, engineUuid: string) {
+	const remote = await api.list("/targets", "targets", {
+		include_onchains: true,
+		policy_engine_id: engineUuid,
+		chain_selector: CHAIN,
+	});
+	const requests: any[] = [];
+	for (const target of manifest.targets) {
+		const address = resolvedAddress(`outputs.registries.${target.registry}.address`);
+		const existing = recordByOnchain(remote, address, "onchain_targets");
+		if (existing) {
+			target.uuid = existing.id;
+			target.converged = true;
+			target.address = address;
+			continue;
+		}
+		target.address = address;
+		requests.push({
+			method: "POST",
+			path: "/targets",
+			body: {
+				title: target.id,
+				description: `Commertize ${target.registry} target`,
+				policy_engine_id: engineUuid,
+				protected_methods: target.entrypoints,
+				onchain_targets: [{ chain_selector: CHAIN, address }],
+				desired_default_allow: target.desiredDefaultAllow,
+			},
+			label: `register ${target.id}`,
+			target,
+		});
+	}
+	return requests;
+}
+
+async function protectionRequests(api: AceApi) {
+	const requests: any[] = [];
+	for (const target of manifest.targets) {
+		invariant(target.uuid, `${target.id}: target has no UUID yet`);
+		invariant(target.address, `${target.id}: target address is missing`);
+		const existing = await api.list(`/targets/${target.uuid}/protections`, "target_protections", {
 			include_onchains: true,
 		});
-		for (const [position, policyConfig] of (item.policyChain ?? []).entries()) {
-			const policyAddress = manifestReference(manifest, policyConfig.policyReference).toLowerCase();
-			const policy = policies.get(policyAddress);
-			const match = existing.find(
-				(record: any) =>
-					record.archived_at == null &&
-					record.policy_instance_id === policy.id &&
-					item.entrypoints.includes(record.function_signature)
-			);
-			if (match) {
-				invariant(match.desired_position === position, `${item.id}: protection position mismatch`);
-				continue;
-			}
-			for (const entrypoint of item.entrypoints) {
+		for (const [position, step] of (target.policyChain ?? []).entries()) {
+			const policy = manifest.policies.find((item: any) => item.id === step.policy);
+			invariant(policy?.uuid, `${target.id}: policy ${step.policy} has no UUID yet`);
+			for (const entrypoint of target.entrypoints) {
+				const match = existing.find(
+					(r: any) =>
+						r.archived_at == null &&
+						r.function_signature === entrypoint &&
+						r.policy_instance_id === policy.uuid
+				);
+				if (match) continue;
 				requests.push({
 					method: "POST",
-					path: `/targets/${target.id}/protections`,
-					label: `${item.id} ${entrypoint} -> ${policyConfig.policyReference} at position ${position}`,
+					path: `/targets/${target.uuid}/protections`,
 					body: {
 						function_signature: entrypoint,
-						policy_instance_id: policy.id,
+						policy_instance_id: policy.uuid,
 						desired_position: position,
-						onchain_target_protections: [
-							{ chain_selector: String(manifest.coordinatorApi.chainSelector) },
-						],
+						onchain_target_protections: [{ chain_selector: CHAIN }],
 						extractor_output_ids: [],
 					},
+					label: `${target.id} ${entrypoint} -> ${policy.id} at position ${position}`,
+					target: null,
 				});
 			}
 		}
@@ -287,156 +363,238 @@ async function protectionRequests(api: AceApi, desired: any, targets: Map<string
 	return requests;
 }
 
-const desiredExtractorsResult = desiredExtractors();
-const desiredTargetsResult = desiredTargets();
-
-if (command === "validate") {
-	console.log(`VALID  ${desiredExtractorsResult.length} extractors, ${desiredTargetsResult.targets.length} targets`);
-	console.log("OK     manifest is internally consistent (offline check)");
-	process.exit(0);
+// ── Write-back / readback ────────────────────────────────────────────────────
+function writeBack(api: AceApi) {
+	// called only on apply after polling; persists the created resources so
+	// deploy.ts and verify can reference them.
+	const outputs = manifest.outputs;
+	for (const item of manifest.extractors) {
+		if (item.uuid) {
+			outputs.extractors[item.id].uuid = item.uuid;
+			outputs.extractors[item.id].address = item.address;
+		}
+	}
+	if (manifest.engine?.uuid && manifest.engine.onchainAddress) {
+		outputs.engine.uuid = manifest.engine.uuid;
+		outputs.engine.address = manifest.engine.onchainAddress;
+	}
+	for (const [id, spec] of Object.entries<any>(manifest.registries)) {
+		if (spec.uuid && spec.onchainAddress) {
+			outputs.registries[id].uuid = spec.uuid;
+			outputs.registries[id].address = spec.onchainAddress;
+		}
+	}
+	for (const policy of manifest.policies) {
+		if (policy.uuid && policy.onchainAddress) {
+			outputs.policies[policy.id].uuid = policy.uuid;
+			outputs.policies[policy.id].address = policy.onchainAddress;
+		}
+	}
+	console.log(`NEXT  manifest ${manifestFile} updated; run scripts/deploy.ts (factory phase) and re-run plan/verify`);
 }
+
+function readbackState() {
+	const output = manifest.outputs;
+	invariant(output.engine?.address && output.engine.address !== ZERO, "outputs.engine.address is empty (run apply first)");
+	invariant(
+		output.registries.identityRegistry?.address !== ZERO && output.registries.credentialRegistry?.address !== ZERO,
+		"registry addresses are empty (run apply first)"
+	);
+	return {
+		engine: output.engine.address,
+		identityRegistry: output.registries.identityRegistry.address,
+		credentialRegistry: output.registries.credentialRegistry.address,
+	};
+}
+
+// ── Pipeline ─────────────────────────────────────────────────────────────────
+validateManifest();
+if (command === "validate") process.exit(0);
 
 await loadDotEnv();
 const apiKeyName = manifest.coordinatorApi.authorizationEnvironmentVariable ?? "ACE_API_KEY";
 const api = new AceApi(manifest.coordinatorApi.baseUrl, process.env[apiKeyName]);
-requireApplyConfirmation(command, flags, manifest.inputs.policyEngine, manifest.network.chainId);
 if (command === "apply") {
 	invariant(manifest.coordinatorApi.tenantAuthenticationConfirmed === true, "Tenant authentication is not confirmed");
+	invariant(
+		flags["confirm-chain-selector"] === CHAIN,
+		`apply requires --confirm-chain-selector ${CHAIN}`
+	);
 }
+await verifyApiNetwork(api, CHAIN, manifest.network.chainId);
 
-await verifyApiNetwork(api, String(manifest.coordinatorApi.chainSelector), manifest.network.chainId);
-const engine = await findPolicyEngine(api, String(manifest.coordinatorApi.chainSelector), manifest.inputs.policyEngine);
-if (manifest.coordinatorApi.policyEngineId) {
-	invariant(engine.id === manifest.coordinatorApi.policyEngineId, "Manifest PolicyEngine UUID mismatch");
-}
-
-// ── Extractors: register records, then associate with the engine ────────────
-const allExtractors = await api.list("/extractors", "extractors", { include_onchains: true });
-const classified = classifyExtractors(allExtractors, desiredExtractorsResult);
-const associated = await api.list("/extractors", "extractors", {
-	include_onchains: true,
-	policy_engine_id: engine.id,
-});
-const associatedIds = new Set(associated.map((extractor: any) => extractor.id));
-
-const recordRequests = [
-	...classified.missing.map((item: any) => ({
-		method: "POST",
-		path: "/extractors",
-		label: `register ${item.name}`,
-		body: item.payload,
-	})),
-	...classified.updates.map(({ remote, desired }: any) => ({
-		method: "PUT",
-		path: `/extractors/${remote.id}`,
-		label: `add ${manifest.network.name} address to ${desired.name}`,
-		body: {
-			...desired.payload,
-			onchain_extractors: [
-				...(remote.onchain_extractors ?? []).map(({ chain_selector, address }: any) => ({
-					chain_selector: String(chain_selector),
-					address,
-				})),
-				{
-					chain_selector: String(manifest.coordinatorApi.chainSelector),
-					address: desired.address,
-				},
-			],
-		},
-	})),
-];
-
-for (const request of recordRequests) {
-	console.log(`${command === "apply" ? "APPLY" : "PLAN "} ${request.method} ${request.path} - ${request.label}`);
+// 1. extractors
+let requests = await extractorRequests(api);
+for (const request of requests) {
+	await runWrite(request.method, request.path, request.body, request.label, api);
 	if (command === "apply") {
-		if (request.method === "POST") await api.post(request.path, request.body);
-		else if (request.method === "PUT") await api.put(request.path, request.body);
+		const record = await api.list("/extractors", "extractors", { include_onchains: true });
+		const created = record.find(
+			(r: any) =>
+				r.archived_at == null &&
+				r.name === request.body.name &&
+				(r.onchain_extractors ?? []).some(
+					(o: any) =>
+						String(o.chain_selector) === CHAIN &&
+						o.address?.toLowerCase() === request.target.address.toLowerCase()
+				)
+		);
+		invariant(created, `${request.body.name}: extractor not found after write`);
+		request.target.uuid = created.id;
 	}
 }
-if (command === "verify") {
-	invariant(recordRequests.length === 0, `${recordRequests.length} extractor records are not converged`);
-}
 
-if (recordRequests.length > 0 && command === "apply") {
-	console.log("NEXT  rerun plan after extractor records converge");
-	process.exit(0);
+// 2. engine (needs extractor UUIDs)
+const extractorUuids = manifest.extractors
+	.filter((item: any) => item.uuid)
+	.map((item: any) => item.uuid);
+invariant(extractorUuids.length === manifest.extractors.length, "extractor UUIDs are incomplete (rerun plan after extractors converge)");
+const { engine, requests: engineReqs } = await engineRequests(api, extractorUuids);
+for (const request of engineReqs) {
+	await runWrite(request.method, request.path, request.body, request.label, api);
 }
-
-const desiredIds = desiredExtractorsResult.map((item: any) => {
-	invariant(classified.matches.get(item.id), `${item.id}: extractor record did not converge`);
-	return classified.matches.get(item.id).id;
-});
-const missingAssociations = desiredIds.filter((id: string) => !associatedIds.has(id));
-if (missingAssociations.length > 0) {
-	const chainSelectors = (engine.onchain_policy_engines ?? []).map((item: any) => String(item.chain_selector));
-	const body: any = {
-		name: engine.name,
-		onchain_policy_engines: [...new Set(chainSelectors)].map((chain_selector) => ({ chain_selector })),
-		extractor_ids: [...new Set([...associatedIds, ...desiredIds])],
-	};
-	if (engine.description) body.description = engine.description;
-	console.log(`${command === "apply" ? "APPLY" : "PLAN "} PUT /policy-engines/${engine.id} - associate extractor UUIDs`);
-	if (command === "apply") await api.put(`/policy-engines/${engine.id}`, body);
-}
-if (command === "verify") {
-	invariant(missingAssociations.length === 0, "Extractor associations are incomplete");
-}
-
-// ── Targets and protections ─────────────────────────────────────────────────
-let targetStateResult = await targetState(api, engine, desiredTargetsResult);
-for (const target of desiredTargetsResult.targets) target.payload.policy_engine_id = engine.id;
-const targetRequests = targetStateResult.missing.map((target: any) => ({
-	method: "POST",
-	path: "/targets",
-	label: `register ${target.id}`,
-	body: target.payload,
-}));
-for (const request of targetRequests) {
-	console.log(`${command === "apply" ? "APPLY" : "PLAN "} ${request.method} ${request.path} - ${request.label}`);
-	if (command === "apply") await api.post(request.path, request.body);
-}
-if (command === "verify") {
-	invariant(targetRequests.length === 0, "Target registrations are incomplete");
-}
-if (targetRequests.length > 0 && command === "apply") {
-	console.log("NEXT  rerun plan after target registrations converge");
-	process.exit(0);
-}
-
-const policyAddresses = [
-	...new Set(
-		desiredTargetsResult.targets.flatMap((target: any) =>
-			target.policyChain.map((policy: any) => manifestReference(manifest, policy.policyReference).toLowerCase())
-		)
-	),
-];
-const policies = await resolvePolicies(api, engine, policyAddresses);
-const requests = await protectionRequests(api, desiredTargetsResult, targetStateResult.matches, policies);
-for (const request of requests) {
-	console.log(`${command === "apply" ? "APPLY" : "PLAN "} ${request.method} ${request.path} - ${request.label}`);
-	if (command === "apply") await api.post(request.path, request.body);
-}
-if (command === "verify") {
-	invariant(requests.length === 0, "Policy protections are incomplete");
-}
-
-// ── Onchain readback (verify only) ───────────────────────────────────────────
-if (command === "verify") {
-	const engineContract = contractAt("PolicyEngine", manifest.inputs.policyEngine);
-	for (const item of desiredExtractorsResult) {
-		const actual = await engineContract.getExtractor(item.selector);
-		invariant(
-			actual.toLowerCase() === item.address.toLowerCase(),
-			`${item.id}: onchain extractor mismatch (${actual})`
+if (command === "apply") {
+	manifest.engine = { ...manifest.engine, ...(engine ?? {}) };
+	if (!manifest.engine.uuid) {
+		const created = (await api.list("/policy-engines", "policy_engines", { include_onchains: true })).find(
+			(r: any) => r.archived_at == null && r.name === manifest.engine.name
 		);
+		manifest.engine.uuid = created?.id;
+	}
+	invariant(manifest.engine.uuid, "engine UUID missing after apply");
+	const ready = await waitForStatus(api, `/policy-engines/${manifest.engine.uuid}`, CHAIN, ["onchain_policy_engines"]);
+	const onchain = (ready.onchain_policy_engines ?? []).find((r: any) => String(r.chain_selector) === CHAIN);
+	manifest.engine.onchainAddress = onchain?.address;
+	console.log(`OK    engine deployed: ${manifest.engine.onchainAddress}`);
+} else {
+	invariant(engine || engineReqs.length === 0, "engine is pending (rerun plan after the engine converges)");
+}
+
+// 3. registries
+requests = await registryRequests(api);
+for (const request of requests) {
+	await runWrite(request.method, request.path, request.body, request.label, api);
+	if (command === "apply") {
+		const created = (await api.list("/registries", "registries", { include_onchains: true })).find(
+			(r: any) => r.archived_at == null && r.name === request.body.name
+		);
+		invariant(created, `${request.body.name}: registry not found after write`);
+		manifest.registries[request.target].uuid = created.id;
+	}
+}
+if (command === "apply") {
+	for (const [id, spec] of Object.entries<any>(manifest.registries)) {
+		invariant(spec.uuid, `${id}: registry UUID missing after apply`);
+		const fields = id === "identityRegistry" ? ["identity_registries"] : ["credential_registries"];
+		const ready = await waitForStatus(api, `/registries/${spec.uuid}`, CHAIN, fields);
+		spec.onchainAddress = (ready[fields[0]] ?? []).find((r: any) => String(r.chain_selector) === CHAIN)?.address;
+		console.log(`OK    ${id} deployed: ${spec.onchainAddress}`);
+	}
+} else {
+	invariant(requests.length === 0 || manifest.registries[Object.keys(manifest.registries)[0]].uuid, "registries are pending (rerun plan after they converge)");
+}
+
+// 4. policy implementations
+requests = await implementationRequests(api);
+for (const request of requests) {
+	await runWrite(request.method, request.path, request.body, request.label, api);
+	if (command === "apply") {
+		const created = (await api.list("/policy-implementations", "policy_implementations", { include_onchains: true })).find(
+			(r: any) => r.archived_at == null && r.name === request.body.name
+		);
+		invariant(created, `${request.body.name}: implementation not found after write`);
+		request.target.uuid = created.id;
+	}
+}
+
+// 5. policy instances (need engine UUID + implementation UUIDs)
+invariant(manifest.engine.uuid, "engine UUID missing");
+requests = await policyRequests(api, manifest.engine.uuid);
+for (const request of requests) {
+	await runWrite(request.method, request.path, request.body, request.label, api);
+	if (command === "apply") {
+		const created = (await api.list("/policies", "policies", { include_onchains: true, policy_engine_id: manifest.engine.uuid })).find(
+			(r: any) => r.archived_at == null && r.name === request.body.name
+		);
+		invariant(created, `${request.body.name}: policy not found after write`);
+		request.target.uuid = created.id;
+	}
+}
+if (command === "apply") {
+	for (const policy of manifest.policies) {
+		invariant(policy.uuid, `${policy.id}: policy UUID missing after apply`);
+		const ready = await waitForStatus(api, `/policies/${policy.uuid}`, CHAIN, ["onchain_policies"]);
+		policy.onchainAddress = (ready.onchain_policies ?? []).find((r: any) => String(r.chain_selector) === CHAIN)?.address;
+		console.log(`OK    policy ${policy.id} created: ${policy.onchainAddress}`);
+	}
+} else {
+	invariant(requests.length === 0 || manifest.policies[0].uuid, "policies are pending (rerun plan after they converge)");
+}
+
+// 6. targets (need registry addresses)
+requests = await targetRequests(api, manifest.engine.uuid);
+for (const request of requests) {
+	await runWrite(request.method, request.path, request.body, request.label, api);
+	if (command === "apply") {
+		const created = (await api.list("/targets", "targets", { include_onchains: true, policy_engine_id: manifest.engine.uuid, chain_selector: CHAIN })).find(
+			(r: any) => r.archived_at == null && r.title === request.body.title
+		);
+		invariant(created, `${request.body.title}: target not found after write`);
+		request.target.uuid = created.id;
+	}
+}
+if (command === "apply") {
+	for (const target of manifest.targets) {
+		invariant(target.uuid, `${target.id}: target UUID missing after apply`);
+		await waitForStatus(api, `/targets/${target.uuid}`, CHAIN, ["onchain_targets"]);
+	}
+}
+
+// 7. protections (need target UUIDs + policy UUIDs)
+requests = await protectionRequests(api);
+for (const request of requests) {
+	await runWrite(request.method, request.path, request.body, request.label, api);
+}
+if (command === "apply" && requests.length > 0) {
+	for (const target of manifest.targets) {
+		const protections = await api.list(`/targets/${target.uuid}/protections`, "target_protections", { include_onchains: true });
+		for (const entrypoint of target.entrypoints) {
+			const records = protections.filter(
+				(r: any) => r.archived_at == null && r.function_signature === entrypoint
+			);
+			for (const record of records) {
+				await waitForStatus(api, `/targets/${target.uuid}/protections/${record.id}`, CHAIN, ["onchain_target_protections"]);
+			}
+			invariant(records.length > 0, `${target.id} ${entrypoint}: no protection found after apply`);
+		}
+	}
+	console.log(`OK    ${manifest.targets.reduce((n: number, t: any) => n + t.entrypoints.length, 0)} protections created`);
+}
+
+// 8. write-back (apply) or onchain readback (verify)
+if (command === "apply") {
+	writeBack(api);
+}
+if (command === "verify") {
+	const state = readbackState();
+	const engineContract = contractAt("PolicyEngine", state.engine);
+	for (const item of manifest.extractors) {
+		const actual = await engineContract.getExtractor(item.selector);
+		invariant(actual.toLowerCase() === item.address.toLowerCase(), `${item.id}: onchain extractor mismatch (${actual})`);
 		console.log(`OK    onchain ${item.selector} -> ${actual}`);
 	}
-	for (const target of desiredTargetsResult.targets) {
+	for (const target of manifest.targets) {
+		const registryAddress = target.registry === "identityRegistry" ? state.identityRegistry : state.credentialRegistry;
 		for (const entrypoint of target.entrypoints) {
-			const policies_ = await engineContract.getPolicies(target.validatorAddress, sel(entrypoint));
-			invariant(policies_.length > 0, `${target.id} ${entrypoint}: no onchain policies`);
-			console.log(`OK    onchain ${target.id} ${entrypoint}: ${policies_.length} policy(ies)`);
+			const policies = await engineContract.getPolicies(registryAddress, sel(entrypoint));
+			invariant(policies.length > 0, `${target.id} ${entrypoint}: no onchain policies`);
+			console.log(`OK    onchain ${target.id} ${entrypoint}: ${policies.length} policy(ies)`);
 		}
 	}
 	console.log("OK    API state and onchain readback are converged");
+}
+
+// persist the manifest only on apply
+if (command === "apply") {
+	await fs.promises.writeFile(manifestFile, JSON.stringify(manifest, null, "\t") + "\n");
 }

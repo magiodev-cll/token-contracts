@@ -7,9 +7,10 @@
 // │  USED TO HOLD OR MOVE ANY ASSET OF VALUE.                                 │
 // └───────────────────────────────────────────────────────────────────────────┘
 // Coordinator API client for the ACE control plane (https://ace.api.chain.link).
-// Mirrors the semantics proven in the Caliber repo (plan/apply/verify with
-// onchain readback reconciliation); production config is API-driven, contract
-// deployment stays onchain (scripts/deploy.ts).
+// Surface per scripts/ace-api-docs/ace-coordinator-api-doc.json. The API owns
+// everything ACE: PolicyEngine deployment, registries, policy instances and
+// policy attachment. Hardhat owns only Commertize's own infra contracts
+// (extractors, policy implementations, factory, tokens - scripts/deploy.ts).
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,10 +30,6 @@ export function isAddress(value: unknown): value is string {
 
 export function sameStrings(left: string[], right: string[]) {
 	return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
-export function manifestReference(manifest: any, reference: string) {
-	return reference.split(".").reduce((value, key) => value?.[key], manifest);
 }
 
 export async function readJson(file: string) {
@@ -147,6 +144,10 @@ export class AceApi {
 		return this.request("PUT", pathname, { body });
 	}
 
+	patch(pathname: string, body: unknown) {
+		return this.request("PATCH", pathname, { body });
+	}
+
 	async list(pathname: string, collectionKey: string, query: Record<string, unknown> = {}) {
 		const items: any[] = [];
 		for (let page = 1; ; page++) {
@@ -180,4 +181,34 @@ export async function verifyApiNetwork(api: AceApi, chainSelector: string, chain
 	invariant(String(network.chain_selector) === String(chainSelector), "ACE API chain selector mismatch");
 	invariant(String(network.chain_id) === String(chainId), "ACE API chain ID mismatch");
 	return network;
+}
+
+export function statusOf(onchain: unknown[] | undefined, chainSelector: string) {
+	const record = (onchain ?? []).find(
+		(item: any) => String(item.chain_selector) === String(chainSelector)
+	);
+	return record?.status ?? "missing";
+}
+
+/** Polls a resource until every requested onchain sub-resource reports "created". */
+export async function waitForStatus(
+	api: AceApi,
+	pathname: string,
+	chainSelector: string,
+	fields: string[],
+	timeoutMs = 120_000
+) {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const resource = await api.get(pathname, { query: { include_onchains: true } });
+		const statuses = fields.map((field) => statusOf(resource[field], chainSelector));
+		if (statuses.every((status) => status === "created")) return resource;
+		if (statuses.some((status) => status === "creation_failed" || status === "failed")) {
+			throw new Error(`${pathname}: creation failed on ${chainSelector}`);
+		}
+		if (Date.now() > deadline) {
+			throw new Error(`${pathname}: not created on ${chainSelector} after ${timeoutMs}ms (${statuses.join(", ")})`);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 5_000));
+	}
 }

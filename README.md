@@ -169,24 +169,36 @@ configured per network in [`networks.ts`](./networks.ts).
 
 ### Control-plane configuration (ACE Coordinator API)
 
-Policy configuration is API-driven in production, not raw onchain calls:
+Everything ACE is managed through the ACE Platform, not raw onchain calls.
+Surface per [`scripts/ace-api-docs/ace-coordinator-api-doc.json`](./scripts/ace-api-docs/ace-coordinator-api-doc.json).
 
-- **Deployment stays onchain** (`scripts/deploy.ts`): engine, registries,
-  extractor/policy instances, factory. The control plane records and manages
-  already-deployed resources.
-- **Configuration goes through the Coordinator API** (`https://ace.api.chain.link/v1`)
-  via `scripts/configure-ace.ts` (`validate | plan | apply | verify`,
-  dry-run-first, apply requires explicit confirmations). The desired state
-  lives in [`scripts/ace-configuration.json`](./scripts/ace-configuration.json):
-  engine extractor association, target registration (with per-target default
-  behavior), and policy protections. `verify` reconciles API state against
-  onchain readback (`getExtractor`, `getPolicies`).
-- **Identity/credential issuance** is the IDV partner's job (e.g. SumSub
-  creating CCIDs and attaching wallets through the authorized writer), not the
-  deployer EOA's.
-- Product tokens and escrows are factory-created per product; their policy
-  wiring is factory-owned onchain and intentionally outside the manifest's
-  scope (see the manifest `notes`).
+- **Hardhat deploys only Commertize's own infra** (`scripts/deploy.ts`,
+  two phases): extractor contracts (stock + `AccountExtractor`) and policy
+  implementation contracts (`DEPLOY_PHASE=extractors`), then the
+  `PropertyFactory` + `PropertyToken` implementation
+  (`DEPLOY_PHASE=factory`, wired to the API-created engine and RejectPolicy).
+- **The Coordinator API creates and wires everything ACE-owned**
+  (`scripts/configure-ace.ts`, `validate | plan | apply | verify`,
+  dry-run-first, apply requires `ACE_CONFIG_CONFIRM_CHAIN_SELECTOR`): deploys
+  the `PolicyEngine`, deploys the identity/credential registries, registers
+  extractors and policy implementations, creates policy instances (writer,
+  reject), registers targets and attaches protections — each resource polled
+  until onchain status is `created`. `apply` writes the created addresses back
+  to [`scripts/ace-configuration.json`](./scripts/ace-configuration.json);
+  `verify` reconciles API state against onchain readback (`getExtractor`,
+  `getPolicies`).
+- **Identity/credential issuance is the IDV partner's job** (e.g. SumSub
+  creating CCIDs and attaching wallets through the Identity Manager API), not
+  the deployer EOA's. In a self-managed KYC scenario your backend drives the
+  Coordinator API's identity/credential endpoints directly.
+- **Beta caveats:** self-deployed contracts aren't visible in the platform
+  UI/API during Beta (the managed path deploys through the API via CRE
+  Connect), and custom extractors (our escrow `AccountExtractor`) are beyond
+  the Beta platform surface (ERC-20/ERC-3643 signatures only) — they still
+  work onchain, just not platform-manageable yet.
+- Product tokens and escrows are factory-created per product; their per-product
+  wiring is factory-owned onchain and outside the manifest's scope (see the
+  manifest `notes`).
 
 ## Deployment strategy — Arbitrum first, CRE before CCIP
 
@@ -194,10 +206,13 @@ Arbitrum One is the target home chain for production; Arbitrum Sepolia is its
 staging mirror. Both Chainlink integrations are code-complete and tested, but
 they activate in phases:
 
-1. **Core protocol on Arbitrum** — the ACE core (`PolicyEngine`, registries,
-   policies, `PropertyFactory`) plus finance (`ListingEscrow`, `DividendVault`)
-   via `pnpm deploy:arbitrum-sepolia` / `deploy:arbitrum-one`. USDC is
-   Circle-native on both networks.
+1. **Core protocol on Arbitrum** — own infra via
+   `pnpm deploy:extractors` then `pnpm deploy:factory` (factory + token
+   implementation), with the ACE-owned surface (`PolicyEngine`, registries,
+   policy instances, protections) created through the Coordinator API
+   (`pnpm config-ace:plan` → `config-ace:apply` → `config-ace:verify`).
+   Finance contracts (`ListingEscrow`, `DividendVault`) deploy with the
+   factory phase. USDC is Circle-native on both networks.
 2. **Pricing oracles via CRE (current focus).** The platform has no on-chain
    pricing oracles today; the first Chainlink integration to go live is the
    property-NAV oracle: deploy `PropertyNavConsumer` with the chain's
@@ -299,21 +314,19 @@ Deployment loading precedence:
 pnpm install
 pnpm compile           # hardhat build
 pnpm test              # hardhat test
-pnpm test:e2e          # full local deployment validation (needs Foundry's anvil)
-pnpm deploy:localhost  # deploy to a running local node
-pnpm deploy:arc-testnet
+pnpm config-ace:validate
+pnpm deploy:extractors # own infra, phase 1: extractor + policy implementation contracts
+pnpm config-ace:plan   # ACE API dry run (needs ACE_API_KEY + org access)
+pnpm config-ace:apply  # creates the PolicyEngine, registries, policies, protections
+pnpm deploy:factory    # own infra, phase 2: factory + token implementation
+pnpm config-ace:verify # API state vs onchain readback
 ```
 
-`pnpm test:e2e` boots an Anvil chain (`--chain-id 5042002`, matching the
-`localhost` network — Hardhat's own node can't serve a custom chain id), runs
-`scripts/deploy.ts` in CI mode, then `scripts/local-e2e.ts` validates the full
-lifecycle on it: KYC, factory-deployed token + escrow, compliance/vault wiring,
-a native raise through `finalize()`, and CRE-consumer + identity-sync
-deployment. CI runs the same thing on every push/PR
+Hardhat tests exercise the full stack on a local node through the shared
+harness (`scripts/lib/ace-core.ts`), which simulates the Coordinator API's end
+state; production configuration is API-driven (`scripts/configure-ace.ts`).
+CI runs the unit suites on every push/PR
 ([.github/workflows/e2e.yaml](./.github/workflows/e2e.yaml)).
-
-Production deploys target Arbitrum One (`pnpm deploy:arbitrum-one`) per the
-[deployment strategy](#deployment-strategy--arbitrum-first-cre-before-ccip).
 
 > Note: `test/TestnetValidation.ts` self-skips (via `process.exit(0)`) when no
 > `deployment.default.json` is present, which ends the whole `hardhat test` run
