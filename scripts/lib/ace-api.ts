@@ -28,10 +28,6 @@ export function isAddress(value: unknown): value is string {
 	return typeof value === "string" && /^0x[0-9a-fA-F]{40}$/.test(value);
 }
 
-export function sameStrings(left: string[], right: string[]) {
-	return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
 export async function readJson(file: string) {
 	return JSON.parse(await fs.promises.readFile(file, "utf8"));
 }
@@ -56,20 +52,6 @@ export async function loadDotEnv(file = path.join(REPO_DIR, ".env")) {
 		}
 		if (!(key in process.env)) process.env[key] = value;
 	}
-}
-
-export function requireApplyConfirmation(
-	command: string,
-	flags: Record<string, string>,
-	policyEngine: string,
-	chainId: number
-) {
-	if (command !== "apply") return;
-	invariant(
-		flags["confirm-policy-engine"]?.toLowerCase() === policyEngine.toLowerCase(),
-		`apply requires --confirm-policy-engine ${policyEngine}`
-	);
-	invariant(String(flags["confirm-chain-id"]) === String(chainId), `apply requires --confirm-chain-id ${chainId}`);
 }
 
 function safeApiError(method: string, url: URL, response: Response, payload: any) {
@@ -144,10 +126,6 @@ export class AceApi {
 		return this.request("PUT", pathname, { body });
 	}
 
-	patch(pathname: string, body: unknown) {
-		return this.request("PATCH", pathname, { body });
-	}
-
 	async list(pathname: string, collectionKey: string, query: Record<string, unknown> = {}) {
 		const items: any[] = [];
 		for (let page = 1; ; page++) {
@@ -158,22 +136,6 @@ export class AceApi {
 			if (page >= totalPages) return items;
 		}
 	}
-}
-
-export async function findPolicyEngine(api: AceApi, chainSelector: string, address: string) {
-	const engines = await api.list("/policy-engines", "policy_engines", { include_onchains: true });
-	const matches = engines.filter(
-		(engine: any) =>
-			engine.archived_at == null &&
-			(engine.onchain_policy_engines ?? []).some(
-				(onchain: any) =>
-					String(onchain.chain_selector) === chainSelector &&
-					onchain.address?.toLowerCase() === address.toLowerCase() &&
-					onchain.status === "created"
-			)
-	);
-	invariant(matches.length === 1, `Expected one existing PolicyEngine at ${address}, found ${matches.length}`);
-	return matches[0];
 }
 
 export async function verifyApiNetwork(api: AceApi, chainSelector: string, chainId: number) {

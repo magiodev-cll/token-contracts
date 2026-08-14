@@ -23,12 +23,9 @@ import fs from "node:fs";
 import path from "node:path";
 import hre from "hardhat";
 import { aceFactory } from "./lib/ace-core";
+import { invariant } from "./lib/ace-api";
 
 const ZERO = `0x${"0".repeat(40)}`;
-
-function invariant(condition: unknown, message: string): asserts condition {
-	if (!condition) throw new Error(message);
-}
 
 const phase = process.env.DEPLOY_PHASE ?? "";
 invariant(["extractors", "factory"].includes(phase), "DEPLOY_PHASE must be 'extractors' or 'factory'");
@@ -76,12 +73,20 @@ if (phase === "extractors") {
 	console.log(`OK    OnlyAuthorizedSenderPolicy impl                ${senderImpl.target}`);
 	console.log(`OK    RejectPolicy impl                              ${rejectImpl.target}`);
 
-	manifest.extractors.find((item: any) => item.id === "erc20-transfer").address = transferExtractor.target;
-	manifest.extractors.find((item: any) => item.id === "erc3643-mint-burn").address = mintBurnExtractor.target;
-	manifest.extractors.find((item: any) => item.id === "escrow-account").address = accountExtractor.target;
-	manifest.policyImplementations.find((item: any) => item.id === "credential-registry-identity-validator").address = eligibilityImpl.target;
-	manifest.policyImplementations.find((item: any) => item.id === "only-authorized-sender").address = senderImpl.target;
-	manifest.policyImplementations.find((item: any) => item.id === "reject").address = rejectImpl.target;
+	for (const [id, contract] of [
+		["erc20-transfer", transferExtractor],
+		["erc3643-mint-burn", mintBurnExtractor],
+		["escrow-account", accountExtractor],
+	] as const) {
+		manifest.extractors.find((item: any) => item.id === id).address = contract.target;
+	}
+	for (const [id, contract] of [
+		["credential-registry-identity-validator", eligibilityImpl],
+		["only-authorized-sender", senderImpl],
+		["reject", rejectImpl],
+	] as const) {
+		manifest.policyImplementations.find((item: any) => item.id === id).address = contract.target;
+	}
 	await writeManifest();
 	return;
 }
