@@ -14,8 +14,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { getNetworkMeta } from "../hardhat.config";
 import { describe, before, it, beforeEach, after } from "node:test";
+import { ethers, contractAt } from "./helpers/ace";
 
-const { ethers, networkName } = await hre.network.connect();
+const { networkName } = await hre.network.getOrCreate();
 
 // ─── Load deployment config ──────────────────────────────────
 
@@ -60,62 +61,84 @@ describe(
 			}
 		});
 
-		// ─── Core Contract Configuration ───────────────────────────
+		// ─── Core Contract Configuration (Chainlink ACE) ───────────
 
 		describe(
-			"IdentityRegistry",
+			"ACE IdentityRegistry",
 			{ skip: !contracts.IdentityRegistry },
 			function () {
 				let ir: any;
 
 				beforeEach(async function () {
-					ir = await ethers.getContractAt(
-						"IdentityRegistry",
-						contracts.IdentityRegistry
+					ir = contractAt("IdentityRegistry", contracts.IdentityRegistry, deployer);
+				});
+
+				it("Deployer is registered (CCID != 0)", async function () {
+					expect(await ir.getIdentity(deployer.address)).to.not.equal(
+						ethers.ZeroHash
 					);
 				});
 
-				it("Deployer has DEFAULT_ADMIN_ROLE", async function () {
-					const adminRole = await ir.DEFAULT_ADMIN_ROLE();
-					expect(await ir.hasRole(adminRole, deployer.address)).to.be.true;
-				});
-
-				it("Deployer is verified", async function () {
-					expect(await ir.isVerified(deployer.address)).to.be.true;
-				});
-
-				it("VERIFIED_ROLE constant is set", async function () {
-					const role = await ir.VERIFIED_ROLE();
-					expect(role).to.not.equal(ethers.ZeroHash);
+				it("Points at the PolicyEngine", async function () {
+					if (!contracts.PolicyEngine) {
+						this.skip();
+						return;
+					}
+					expect(await ir.getPolicyEngine()).to.equal(contracts.PolicyEngine);
 				});
 			}
 		);
 
 		describe(
-			"TokenCompliance",
-			{ skip: !contracts.TokenCompliance },
+			"ACE CredentialRegistry",
+			{ skip: !contracts.CredentialRegistry },
 			function () {
-				let tc: any;
+				let cr: any;
 
 				beforeEach(async function () {
-					tc = await ethers.getContractAt(
-						"TokenCompliance",
-						contracts.TokenCompliance
-					);
+					cr = contractAt("CredentialRegistry", contracts.CredentialRegistry, deployer);
 				});
 
-				it("Owner is deployer", async function () {
-					expect(await tc.owner()).to.equal(deployer.address);
+				it("Deployer's CCID has the KYC credential", async function () {
+					const ccid = ethers.zeroPadValue(deployer.address, 32);
+					expect(
+						await cr.validate(
+							ccid,
+							ethers.keccak256(ethers.toUtf8Bytes("common.kyc")),
+							"0x"
+						)
+					).to.be.true;
+				});
+			}
+		);
+
+		describe(
+			"PolicyEngine",
+			{ skip: !contracts.PolicyEngine },
+			function () {
+				let engine: any;
+
+				beforeEach(async function () {
+					engine = contractAt("PolicyEngine", contracts.PolicyEngine, deployer);
 				});
 
-				it("Points to the correct IdentityRegistry", async function () {
-					if (!contracts.IdentityRegistry) {
+				it("Deployer holds DEFAULT_ADMIN_ROLE", async function () {
+					expect(
+						await engine.hasRole(await engine.DEFAULT_ADMIN_ROLE(), deployer.address)
+					).to.be.true;
+				});
+
+				it("Registry writer policy authorizes the deployer", async function () {
+					if (!contracts.RegistryWriterPolicy) {
 						this.skip();
 						return;
 					}
-					expect(await tc.identityRegistry()).to.equal(
-						contracts.IdentityRegistry
+					const writer = contractAt(
+						"OnlyAuthorizedSenderPolicy",
+						contracts.RegistryWriterPolicy,
+						deployer
 					);
+					expect(await writer.senderAuthorized(deployer.address)).to.be.true;
 				});
 			}
 		);
@@ -137,10 +160,13 @@ describe(
 					expect(await factory.owner()).to.equal(deployer.address);
 				});
 
-				it("Can query deployed properties", async function () {
-					const properties = await factory.getDeployedProperties();
-					console.log(`      Deployed properties: ${properties.length}`);
-					expect(properties).to.be.an("array");
+				it("Can query product records", async function () {
+					const next = await factory.nextProductId();
+					console.log(`      Product count: ${next - 1n}`);
+					expect(next).to.be.greaterThan(0);
+					if (next > 1n) {
+						await factory.getProduct(1n);
+					}
 				});
 
 				it("Can query deployed escrows", async function () {
@@ -151,7 +177,7 @@ describe(
 			}
 		);
 
-		// ─── Property Tokens ───────────────────────────────────────
+		// ─── Property Tokens (ACE products) ───────────────────────
 
 		describe(
 			"Property Tokens (from Factory)",
@@ -166,7 +192,12 @@ describe(
 						"PropertyFactory",
 						contracts.PropertyFactory
 					);
-					propertyAddresses = await factory.getDeployedProperties();
+					const next = await factory.nextProductId();
+					propertyAddresses = [];
+					for (let id = 1n; id < next; id++) {
+						const record = await factory.getProduct(id);
+						propertyAddresses.push(record.token);
+					}
 					hasProperties = propertyAddresses.length > 0;
 				});
 
@@ -195,20 +226,18 @@ describe(
 					);
 					const name = await pt.name();
 					const symbol = await pt.symbol();
-					const supply = await pt.totalSupply();
 					const owner = await pt.owner();
 
 					console.log(`      Token: ${name} (${symbol})`);
-					console.log(`      Supply: ${ethers.formatEther(supply)}`);
+					console.log(`      Supply: ${ethers.formatEther(await pt.totalSupply())}`);
 					console.log(`      Owner: ${owner}`);
 
 					expect(name.length).to.be.greaterThan(0);
 					expect(symbol.length).to.be.greaterThan(0);
-					expect(supply).to.be.greaterThan(0);
 				});
 
-				it("First property token points to correct compliance", async function () {
-					if (!hasProperties || !contracts.TokenCompliance) {
+				it("First property token points at the PolicyEngine", async function () {
+					if (!hasProperties || !contracts.PolicyEngine) {
 						this.skip();
 						return;
 					}
@@ -216,7 +245,7 @@ describe(
 						"PropertyToken",
 						propertyAddresses[0]
 					);
-					expect(await pt.compliance()).to.equal(contracts.TokenCompliance);
+					expect(await pt.getPolicyEngine()).to.equal(contracts.PolicyEngine);
 				});
 			}
 		);

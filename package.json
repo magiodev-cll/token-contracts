@@ -67,11 +67,13 @@
 		"prompts": "^2.4.2"
 	},
 	"dependencies": {
+		"@chainlink/ace": "1.2.0",
 		"@chainlink/contracts": "1.5.0",
 		"@chainlink/contracts-ccip": "1.6.4",
-		"@commertize/utils": "workspace:*",
 		"@openzeppelin/contracts-upgradeable": "^5.6.1",
+		"@openzeppelin/contracts@5.3.0": "npm:@openzeppelin/contracts@5.3.0",
 		"dotenv": "^17.3.1",
-		"ethers": "^6.16.0"
+		"ethers": "^6.16.0",
+		"@commertize/utils": "workspace:*"
 	}
 }

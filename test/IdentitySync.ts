@@ -1,69 +1,61 @@
 import { expect } from "chai";
 import hre from "hardhat";
-
-const { ethers } = await hre.network.connect();
-
-const KYC = () => ethers.keccak256(ethers.toUtf8Bytes("KYC"));
+import {
+	ethers,
+	deployAceCore,
+	ccidFor,
+	KYC,
+	AML,
+} from "./helpers/ace";
 
 describe("Cross-chain Identity Sync", function () {
 	let admin: any;
 	let user: any;
 	let outsider: any;
 	let routerSigner: any; // stands in for the CCIP router calling ccipReceive
-	let identityRegistry: any;
+	let core: any;
 
 	before(async function () {
 		[admin, user, outsider, routerSigner] = await ethers.getSigners();
-		const IdentityRegistry =
-			await ethers.getContractFactory("IdentityRegistry");
-		identityRegistry = await IdentityRegistry.deploy(admin.address);
-		await identityRegistry.waitForDeployment();
+		core = await deployAceCore(admin);
 	});
 
-	describe("IdentityRegistry SYNC_ROLE", function () {
-		it("admin registration still works via registerIdentity", async function () {
-			await identityRegistry.registerIdentity(user.address, 840, KYC());
-			expect(await identityRegistry.isVerified(user.address)).to.equal(true);
-			await identityRegistry.removeIdentity(user.address);
-			expect(await identityRegistry.isVerified(user.address)).to.equal(false);
-		});
-
-		it("syncRegisterIdentity requires SYNC_ROLE", async function () {
-			await expect(
-				identityRegistry
-					.connect(outsider)
-					.syncRegisterIdentity(user.address, 840, KYC())
-			).to.be.revertedWithCustomError(
-				identityRegistry,
-				"AccessControlUnauthorizedAccount"
+	describe("ACE registry writer policy", function () {
+		it("an authorized writer can register and remove identities", async function () {
+			await core.identityRegistry
+				.connect(admin)
+				.registerIdentity(ccidFor(user.address), user.address, "0x");
+			expect(await core.identityRegistry.getIdentity(user.address)).to.equal(
+				ccidFor(user.address)
+			);
+			await core.identityRegistry
+				.connect(admin)
+				.removeIdentity(ccidFor(user.address), user.address, "0x");
+			expect(await core.identityRegistry.getIdentity(user.address)).to.equal(
+				ethers.ZeroHash
 			);
 		});
 
-		it("blocks direct VERIFIED_ROLE grant/revoke/renounce", async function () {
-			const VERIFIED_ROLE = await identityRegistry.VERIFIED_ROLE();
+		it("an unauthorized caller cannot write to the registries", async function () {
 			await expect(
-				identityRegistry.grantRole(VERIFIED_ROLE, user.address)
-			).to.be.revertedWith("Use registerIdentity");
-			await identityRegistry.registerIdentity(user.address, 840, KYC());
-			await expect(
-				identityRegistry.revokeRole(VERIFIED_ROLE, user.address)
-			).to.be.revertedWith("Use removeIdentity");
-			await expect(
-				identityRegistry
-					.connect(user)
-					.renounceRole(VERIFIED_ROLE, user.address)
-			).to.be.revertedWith("Use removeIdentity");
-			await identityRegistry.removeIdentity(user.address);
+				core.identityRegistry
+					.connect(outsider)
+					.registerIdentity(ccidFor(user.address), user.address, "0x")
+			).to.be.revertedWithCustomError(core.engine, "PolicyRunRejected");
 		});
 
-		it("a SYNC_ROLE holder can mirror register/remove", async function () {
-			const SYNC_ROLE = await identityRegistry.SYNC_ROLE();
-			await identityRegistry.grantRole(SYNC_ROLE, admin.address);
-			await identityRegistry.syncRegisterIdentity(user.address, 840, KYC());
-			expect(await identityRegistry.isVerified(user.address)).to.equal(true);
-			await identityRegistry.syncRemoveIdentity(user.address);
-			expect(await identityRegistry.isVerified(user.address)).to.equal(false);
-			await identityRegistry.revokeRole(SYNC_ROLE, admin.address);
+		it("a newly authorized issuer can write (OnlyAuthorizedSenderPolicy)", async function () {
+			await core.writerPolicy.authorizeSender(outsider.address);
+			await core.identityRegistry
+				.connect(outsider)
+				.registerIdentity(ccidFor(user.address), user.address, "0x");
+			expect(await core.identityRegistry.getIdentity(user.address)).to.equal(
+				ccidFor(user.address)
+			);
+			await core.identityRegistry
+				.connect(admin)
+				.removeIdentity(ccidFor(user.address), user.address, "0x");
+			await core.writerPolicy.unauthorizeSender(outsider.address);
 		});
 	});
 
@@ -77,13 +69,14 @@ describe("Cross-chain Identity Sync", function () {
 			// router = routerSigner so we can invoke ccipReceive as the router
 			receiver = await Receiver.deploy(
 				routerSigner.address,
-				identityRegistry.target,
+				core.identityRegistry.target,
+				core.credentialRegistry.target,
 				admin.address
 			);
 			await receiver.waitForDeployment();
-			// grant the receiver SYNC_ROLE on the registry
-			const SYNC_ROLE = await identityRegistry.SYNC_ROLE();
-			await identityRegistry.grantRole(SYNC_ROLE, receiver.target);
+			// the receiver writes to the destination registries through the
+			// registry writer policy (replaces the old SYNC_ROLE grant)
+			await core.writerPolicy.authorizeSender(await receiver.getAddress());
 			await receiver.setTrustedSender(SOURCE_SELECTOR, trustedSenderAddr);
 		});
 
@@ -103,13 +96,26 @@ describe("Cross-chain Identity Sync", function () {
 		function payload(
 			isRemoval: boolean,
 			userAddr: string,
-			country: number,
+			ccid: string,
+			credentialType: string,
+			enabled: boolean,
+			expiresAt: bigint,
 			seq: bigint
 		) {
 			return ethers.AbiCoder.defaultAbiCoder().encode(
-				["bool", "address", "uint16", "bytes32", "uint64"],
-				[isRemoval, userAddr, country, KYC(), seq]
+				["bool", "address", "bytes32", "bytes32", "bool", "uint40", "uint64"],
+				[isRemoval, userAddr, ccid, credentialType, enabled, expiresAt, seq]
 			);
+		}
+
+		function registerPayload(seq: bigint) {
+			return payload(false, user.address, ccidFor(user.address), ethers.ZeroHash, false, 0n, seq);
+		}
+		function removePayload(seq: bigint) {
+			return payload(true, user.address, ethers.ZeroHash, ethers.ZeroHash, false, 0n, seq);
+		}
+		function credentialPayload(type: string, enabled: boolean, seq: bigint) {
+			return payload(false, user.address, ethers.ZeroHash, type, enabled, 0n, seq);
 		}
 
 		it("rejects a call from a non-router caller", async function () {
@@ -117,7 +123,7 @@ describe("Cross-chain Identity Sync", function () {
 				receiver
 					.connect(outsider)
 					.ccipReceive(
-						message(trustedSenderAddr, payload(false, user.address, 840, 1n))
+						message(trustedSenderAddr, registerPayload(1n))
 					)
 			).to.be.revertedWithCustomError(receiver, "InvalidRouter");
 		});
@@ -127,7 +133,7 @@ describe("Cross-chain Identity Sync", function () {
 				receiver
 					.connect(routerSigner)
 					.ccipReceive(
-						message(outsider.address, payload(false, user.address, 840, 1n))
+						message(outsider.address, registerPayload(1n))
 					)
 			).to.be.revertedWithCustomError(receiver, "UntrustedSource");
 		});
@@ -136,9 +142,11 @@ describe("Cross-chain Identity Sync", function () {
 			await receiver
 				.connect(routerSigner)
 				.ccipReceive(
-					message(trustedSenderAddr, payload(false, user.address, 840, 1n))
+					message(trustedSenderAddr, registerPayload(1n))
 				);
-			expect(await identityRegistry.isVerified(user.address)).to.equal(true);
+			expect(await core.identityRegistry.getIdentity(user.address)).to.equal(
+				ccidFor(user.address)
+			);
 			expect(await receiver.lastSeq(user.address)).to.equal(1n);
 		});
 
@@ -146,23 +154,60 @@ describe("Cross-chain Identity Sync", function () {
 			await receiver
 				.connect(routerSigner)
 				.ccipReceive(
-					message(trustedSenderAddr, payload(true, user.address, 0, 2n))
+					message(trustedSenderAddr, removePayload(2n))
 				);
-			expect(await identityRegistry.isVerified(user.address)).to.equal(false);
+			expect(await core.identityRegistry.getIdentity(user.address)).to.equal(
+				ethers.ZeroHash
+			);
+		});
+
+		it("mirrors credential changes (with expiry) from the trusted sender", async function () {
+			// identity must exist before credentials can be applied
+			await receiver
+				.connect(routerSigner)
+				.ccipReceive(
+					message(trustedSenderAddr, registerPayload(3n))
+				);
+			const ccid = ccidFor(user.address);
+
+			await receiver
+				.connect(routerSigner)
+				.ccipReceive(
+					message(trustedSenderAddr, credentialPayload(KYC(), true, 4n))
+				);
+			expect(await core.credentialRegistry.validate(ccid, KYC(), "0x")).to.equal(true);
+			expect(await core.credentialRegistry.validate(ccid, AML(), "0x")).to.equal(false);
+
+			// removal mirrors the same way
+			await receiver
+				.connect(routerSigner)
+				.ccipReceive(
+					message(trustedSenderAddr, credentialPayload(KYC(), false, 5n))
+				);
+			expect(await core.credentialRegistry.validate(ccid, KYC(), "0x")).to.equal(false);
+
+			// cleanup
+			await receiver
+				.connect(routerSigner)
+				.ccipReceive(
+					message(trustedSenderAddr, removePayload(6n))
+				);
 		});
 
 		it("discards a stale register replayed after a newer remove (reorder attack)", async function () {
-			// user was removed at seq 2; a stuck seq-1 register executed late
+			// user was removed at seq 6; a stuck seq-1 register executed late
 			// must NOT re-verify them.
 			await expect(
 				receiver
 					.connect(routerSigner)
 					.ccipReceive(
-						message(trustedSenderAddr, payload(false, user.address, 840, 1n))
+						message(trustedSenderAddr, registerPayload(1n))
 					)
 			).to.emit(receiver, "StaleSyncDiscarded");
-			expect(await identityRegistry.isVerified(user.address)).to.equal(false);
-			expect(await receiver.lastSeq(user.address)).to.equal(2n);
+			expect(await core.identityRegistry.getIdentity(user.address)).to.equal(
+				ethers.ZeroHash
+			);
+			expect(await receiver.lastSeq(user.address)).to.equal(6n);
 		});
 
 		it("discards an equal-seq replay of the last applied message", async function () {
@@ -170,7 +215,7 @@ describe("Cross-chain Identity Sync", function () {
 				receiver
 					.connect(routerSigner)
 					.ccipReceive(
-						message(trustedSenderAddr, payload(true, user.address, 0, 2n))
+						message(trustedSenderAddr, removePayload(6n))
 					)
 			).to.emit(receiver, "StaleSyncDiscarded");
 		});
@@ -179,9 +224,17 @@ describe("Cross-chain Identity Sync", function () {
 			await receiver
 				.connect(routerSigner)
 				.ccipReceive(
-					message(trustedSenderAddr, payload(false, user.address, 840, 3n))
+					message(trustedSenderAddr, registerPayload(7n))
 				);
-			expect(await identityRegistry.isVerified(user.address)).to.equal(true);
+			expect(await core.identityRegistry.getIdentity(user.address)).to.equal(
+				ccidFor(user.address)
+			);
+			// cleanup for subsequent suites
+			await receiver
+				.connect(routerSigner)
+				.ccipReceive(
+					message(trustedSenderAddr, removePayload(8n))
+				);
 		});
 
 		it("enforces a single active source (lastSeq is one sequence space)", async function () {
@@ -231,7 +284,7 @@ describe("Cross-chain Identity Sync", function () {
 
 		it("reverts broadcast with no destinations", async function () {
 			await expect(
-				sender.broadcastRegister(user.address, 840, KYC())
+				sender.broadcastRegister(user.address, ccidFor(user.address))
 			).to.be.revertedWithCustomError(sender, "NoDestinations");
 		});
 
@@ -242,7 +295,7 @@ describe("Cross-chain Identity Sync", function () {
 
 			const before = await mockRouter.sendCount();
 			// send more than 2*FEE; expect exact 2*FEE consumed, remainder refunded
-			await sender.broadcastRegister(user.address, 840, KYC(), {
+			await sender.broadcastRegister(user.address, ccidFor(user.address), {
 				value: FEE * 3n,
 			});
 			expect(await mockRouter.sendCount()).to.equal(before + 2n);
@@ -256,19 +309,19 @@ describe("Cross-chain Identity Sync", function () {
 
 		it("reverts when native value cannot cover the fees", async function () {
 			await expect(
-				sender.broadcastRegister(user.address, 840, KYC(), { value: FEE })
+				sender.broadcastRegister(user.address, ccidFor(user.address), { value: FEE })
 			).to.be.revertedWithCustomError(sender, "InsufficientNativeFee");
 		});
 
 		it("enforces maxFeePerMessage across the loop", async function () {
 			await sender.setMaxFeePerMessage(FEE); // exactly the current fee is ok
-			await sender.broadcastRegister(user.address, 840, KYC(), {
+			await sender.broadcastRegister(user.address, ccidFor(user.address), {
 				value: FEE * 2n,
 			});
 			// raise the router fee above the cap -> revert
 			await mockRouter.setFee(FEE + 1n);
 			await expect(
-				sender.broadcastRegister(user.address, 840, KYC(), { value: FEE * 4n })
+				sender.broadcastRegister(user.address, ccidFor(user.address), { value: FEE * 4n })
 			).to.be.revertedWithCustomError(sender, "FeeExceedsMax");
 			// reset
 			await mockRouter.setFee(FEE);
@@ -279,13 +332,29 @@ describe("Cross-chain Identity Sync", function () {
 			const seqBefore = await sender.userSeq(user.address);
 			await sender.broadcastRemove(user.address, { value: FEE * 2n });
 			const decoded = ethers.AbiCoder.defaultAbiCoder().decode(
-				["bool", "address", "uint16", "bytes32", "uint64"],
+				["bool", "address", "bytes32", "bytes32", "bool", "uint40", "uint64"],
 				await mockRouter.lastData()
 			);
 			expect(decoded[0]).to.equal(true); // isRemoval
 			expect(decoded[1]).to.equal(user.address);
-			expect(decoded[4]).to.equal(seqBefore + 1n); // seq incremented
+			expect(decoded[6]).to.equal(seqBefore + 1n); // seq incremented
 			expect(await sender.userSeq(user.address)).to.equal(seqBefore + 1n);
+		});
+
+		it("encodes a credential broadcast with type and enable flag", async function () {
+			const seqBefore = await sender.userSeq(user.address);
+			await sender.broadcastCredential(user.address, KYC(), true, 0n, {
+				value: FEE * 2n,
+			});
+			const decoded = ethers.AbiCoder.defaultAbiCoder().decode(
+				["bool", "address", "bytes32", "bytes32", "bool", "uint40", "uint64"],
+				await mockRouter.lastData()
+			);
+			expect(decoded[0]).to.equal(false); // not a removal
+			expect(decoded[1]).to.equal(user.address);
+			expect(decoded[3]).to.equal(KYC());
+			expect(decoded[4]).to.equal(true);
+			expect(decoded[6]).to.equal(seqBefore + 1n);
 		});
 
 		it("removes a cleared destination so re-adding cannot duplicate it", async function () {
@@ -296,7 +365,7 @@ describe("Cross-chain Identity Sync", function () {
 			expect(await sender.destinationCount()).to.equal(2n);
 
 			const before = await mockRouter.sendCount();
-			await sender.broadcastRegister(user.address, 840, KYC(), {
+			await sender.broadcastRegister(user.address, ccidFor(user.address), {
 				value: FEE * 3n,
 			});
 			// exactly 2 sends — a duplicated selector would produce 3.

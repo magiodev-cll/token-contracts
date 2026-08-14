@@ -4,6 +4,12 @@ import path from "node:path";
 import prompts from "prompts";
 import chalk from "chalk";
 import { getNetworkMeta } from "../hardhat.config";
+import {
+	ethers,
+	deployAceCore,
+	onboard,
+	ccidFor,
+} from "../scripts/lib/ace-core";
 
 interface DeploymentConfig {
 	contracts: Record<string, string>;
@@ -23,7 +29,7 @@ interface DeployContext {
 	deployedAddresses: Record<string, string>;
 }
 
-const { ethers, networkName } = await hre.network.connect();
+const { networkName } = await hre.network.getOrCreate();
 
 console.log(chalk.bold.blue("\nCommertize Interactive Deployment CLI (MVP)\n"));
 
@@ -85,23 +91,13 @@ if (usdcAddress) {
 
 const contracts = [
 	{
-		name: "IdentityRegistry",
-		title: "1. Identity Registry (Compliance)",
-		value: "IdentityRegistry",
-	},
-	{
-		name: "TokenCompliance",
-		title: "2. Token Compliance (Requires IdentityRegistry)",
-		value: "TokenCompliance",
-	},
-	{
-		name: "PropertyFactory",
-		title: "3. Property Factory (Requires Compliance)",
-		value: "PropertyFactory",
+		name: "AceCore",
+		title: "1. ACE Core (engine, registries, policies, factory)",
+		value: "AceCore",
 	},
 	{
 		name: "DividendVault",
-		title: "4. Dividend Vault (Requires USDC from fork)",
+		title: "2. Dividend Vault (Requires USDC from fork)",
 		value: "DividendVault",
 	},
 ];
@@ -133,60 +129,48 @@ if (args.includes("--all") || process.env.CI) {
 
 console.log(chalk.bold("\n⚡ Starting Deployment...\n"));
 
-// 1. Identity Registry
-if (selectedContracts.has("IdentityRegistry")) {
-	await deployContract("IdentityRegistry", [deployer.address], context);
+// 1. ACE Core (shared: engine, registries, extractors, policies, factory)
+if (selectedContracts.has("AceCore")) {
+	console.log("Deploying ACE core...");
+	const core = await deployAceCore(deployer);
 
-	// Register Deployer/Admin as Verified Identity (Required for receiving initial mints)
+	const coreAddresses = {
+		PolicyEngine: core.engine.target,
+		IdentityRegistry: core.identityRegistry.target,
+		CredentialRegistry: core.credentialRegistry.target,
+		RegistryWriterPolicy: core.writerPolicy.target,
+		RejectPolicy: core.rejectPolicy.target,
+		PropertyFactory: core.factory.target,
+	};
+	for (const [key, address] of Object.entries(coreAddresses)) {
+		context.deployedAddresses[key] = address;
+		context.deploymentConfig.contracts[key] = address;
+	}
+
+	// Authenticate the deployer as an eligible operator (KYC + AML) so they can
+	// act as product owner and receive mints.
 	try {
 		console.log("  Authenticating Deployer...");
-		const identityRegistry = await ethers.getContractAt(
-			"IdentityRegistry",
-			context.deployedAddresses.IdentityRegistry,
-			deployer
-		);
-		// Hash "ADMIN" for the deployer identity
-		const adminHash = ethers.keccak256(ethers.toUtf8Bytes("ADMIN"));
-		const tx = await identityRegistry.registerIdentity(
-			deployer.address,
-			840,
-			adminHash
-		); // 840 = US
-		await tx.wait();
+		await onboard(core, deployer, deployer);
 		console.log(
-			`  [OK] Deployer ${chalk.green(deployer.address)} authenticated (Country: 840, Hash: ADMIN)`
+			`  [OK] Deployer ${chalk.green(deployer.address)} onboarded (CCID: ${ccidFor(deployer.address)})`
 		);
 	} catch (err: any) {
 		console.warn(
 			chalk.yellow(`  Warning: Failed to authenticate deployer: ${err.message}`)
 		);
 	}
+
+	console.log(`  └─ Addresses:
+    PolicyEngine:        ${chalk.green(core.engine.target)}
+    IdentityRegistry:    ${chalk.green(core.identityRegistry.target)}
+    CredentialRegistry:  ${chalk.green(core.credentialRegistry.target)}
+    RegistryWriterPolicy:${chalk.green(core.writerPolicy.target)}
+    RejectPolicy:        ${chalk.green(core.rejectPolicy.target)}
+    PropertyFactory:     ${chalk.green(core.factory.target)}`);
 }
 
-// USDC: not deployed; use address from Anvil fork in deployment.*.json (e.g. deployment.localhost.json).
-
-// 2. Token Compliance
-if (selectedContracts.has("TokenCompliance")) {
-	const idRegistry = context.deployedAddresses.IdentityRegistry;
-	if (!idRegistry) {
-		console.error(
-			chalk.red("Error: TokenCompliance requires IdentityRegistry.")
-		);
-	} else {
-		await deployContract(
-			"TokenCompliance",
-			[idRegistry, deployer.address],
-			context
-		);
-	}
-}
-
-// 3. Property Factory
-if (selectedContracts.has("PropertyFactory")) {
-	await deployContract("PropertyFactory", [deployer.address], context);
-}
-
-// 4. Dividend Vault
+// 2. Dividend Vault
 if (selectedContracts.has("DividendVault")) {
 	const usdc = context.deployedAddresses.USDC;
 	if (!usdc) {

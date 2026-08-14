@@ -6,12 +6,13 @@ import { getNetwork } from "../networks";
  * Wires cross-chain identity sync on the CONNECTED network. Because the pieces
  * live on different chains, run this once per chain with the relevant env set:
  *
- * On a DESTINATION chain (has IdentityRegistry + IdentitySyncReceiver):
- *   SYNC_REGISTRY=0x...        # IdentityRegistry
- *   SYNC_RECEIVER=0x...        # IdentitySyncReceiver deployed here
- *   SYNC_SOURCE_SELECTOR=...   # home chain's CCIP selector
- *   SYNC_HOME_SENDER=0x...     # IdentitySyncSender address on the home chain
- *   -> grants SYNC_ROLE to the receiver, sets its trusted sender.
+ * On a DESTINATION chain (has ACE IdentityRegistry/CredentialRegistry +
+ * IdentitySyncReceiver):
+ *   SYNC_WRITER_POLICY=0x...  # the registry writer policy (OnlyAuthorizedSenderPolicy)
+ *   SYNC_RECEIVER=0x...       # IdentitySyncReceiver deployed here
+ *   SYNC_SOURCE_SELECTOR=...  # home chain's CCIP selector
+ *   SYNC_HOME_SENDER=0x...    # IdentitySyncSender address on the home chain
+ *   -> authorizes the receiver as a registry writer, sets its trusted sender.
  *
  * On the HOME chain (has IdentitySyncSender):
  *   SYNC_SENDER=0x...          # IdentitySyncSender deployed here
@@ -24,10 +25,9 @@ import { getNetwork } from "../networks";
  * Usage: hardhat run --network arc-testnet scripts/setup-identity-sync.ts
  */
 
-const REGISTRY_ABI = [
-	"function SYNC_ROLE() view returns (bytes32)",
-	"function hasRole(bytes32 role, address account) view returns (bool)",
-	"function grantRole(bytes32 role, address account)",
+const WRITER_POLICY_ABI = [
+	"function senderAuthorized(address account) view returns (bool)",
+	"function authorizeSender(address account)",
 ];
 const RECEIVER_ABI = [
 	"function setTrustedSender(uint64 sourceChainSelector, address sender)",
@@ -38,7 +38,7 @@ const SENDER_ABI = [
 	"function destReceiver(uint64) view returns (address)",
 ];
 
-const { ethers, networkName } = await hre.network.connect();
+const { ethers, networkName } = await hre.network.getOrCreate();
 const [signer] = await ethers.getSigners();
 
 try {
@@ -56,17 +56,16 @@ console.log(`Signer: ${chalk.yellow(signer.address)}`);
 let didSomething = false;
 
 // Destination-side wiring.
-if (process.env.SYNC_REGISTRY && process.env.SYNC_RECEIVER) {
-	const registryAddr = ethers.getAddress(process.env.SYNC_REGISTRY);
+if (process.env.SYNC_WRITER_POLICY && process.env.SYNC_RECEIVER) {
+	const writerAddr = ethers.getAddress(process.env.SYNC_WRITER_POLICY);
 	const receiverAddr = ethers.getAddress(process.env.SYNC_RECEIVER);
-	const registry = new ethers.Contract(registryAddr, REGISTRY_ABI, signer);
-	const syncRole = await registry.SYNC_ROLE();
+	const writer = new ethers.Contract(writerAddr, WRITER_POLICY_ABI, signer);
 
-	if (await registry.hasRole(syncRole, receiverAddr)) {
-		console.log("SYNC_ROLE: receiver already granted.");
+	if (await writer.senderAuthorized(receiverAddr)) {
+		console.log("Writer policy: receiver already authorized.");
 	} else {
-		console.log("Granting SYNC_ROLE to the receiver...");
-		await (await registry.grantRole(syncRole, receiverAddr)).wait();
+		console.log("Authorizing the receiver as a registry writer...");
+		await (await writer.authorizeSender(receiverAddr)).wait();
 	}
 
 	if (process.env.SYNC_SOURCE_SELECTOR && process.env.SYNC_HOME_SENDER) {
@@ -124,7 +123,7 @@ if (process.env.SYNC_SENDER) {
 
 if (!didSomething) {
 	console.error(
-		"Error: nothing to do. Set the destination-side (SYNC_REGISTRY + SYNC_RECEIVER) or home-side (SYNC_SENDER) env vars."
+		"Error: nothing to do. Set the destination-side (SYNC_WRITER_POLICY + SYNC_RECEIVER) or home-side (SYNC_SENDER) env vars."
 	);
 	process.exit(1);
 }

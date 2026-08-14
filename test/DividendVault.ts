@@ -1,9 +1,14 @@
 import { expect } from "chai";
 import hre from "hardhat";
+import {
+	ethers,
+	deployAceCore,
+	onboard,
+	baseEligibilityConfig,
+	ccidFor,
+	KYC,
+} from "./helpers/ace";
 
-const { ethers } = await hre.network.connect();
-
-const KYC = () => ethers.keccak256(ethers.toUtf8Bytes("KYC"));
 const YEAR = 365 * 24 * 60 * 60;
 
 describe("DividendVault behavior", function () {
@@ -11,8 +16,7 @@ describe("DividendVault behavior", function () {
 	let alice: any;
 	let bob: any;
 	let protocol: any;
-	let registry: any;
-	let compliance: any;
+	let core: any;
 	let token: any;
 	let usdc: any;
 	let vault: any;
@@ -22,31 +26,31 @@ describe("DividendVault behavior", function () {
 
 	beforeEach(async function () {
 		[admin, alice, bob, protocol] = await ethers.getSigners();
-
-		const IdentityRegistry = await ethers.getContractFactory("IdentityRegistry");
-		registry = await IdentityRegistry.deploy(admin.address);
-		await registry.waitForDeployment();
-
-		const TokenCompliance = await ethers.getContractFactory("TokenCompliance");
-		compliance = await TokenCompliance.deploy(
-			await registry.getAddress(),
-			admin.address
-		);
-		await compliance.waitForDeployment();
+		core = await deployAceCore(admin);
 
 		for (const s of [admin, alice, bob]) {
-			await registry.registerIdentity(s.address, 840, KYC());
+			await onboard(core, admin, s);
 		}
 
+		const { sources, requirements } = baseEligibilityConfig(core);
+		const productId = await core.factory.nextProductId();
+		await core.factory
+			.connect(admin)
+			.createProduct(
+				"Prop",
+				"PROP",
+				18,
+				sources,
+				requirements,
+				true,
+				admin.address,
+				admin.address
+			);
+		const record = await core.factory.getProduct(productId);
 		const PropertyToken = await ethers.getContractFactory("PropertyToken");
-		token = await PropertyToken.deploy(
-			"Prop",
-			"PROP",
-			SUPPLY,
-			await compliance.getAddress(),
-			admin.address
-		);
-		await token.waitForDeployment();
+		token = PropertyToken.attach(record.token);
+
+		await token.connect(admin).mint(admin.address, SUPPLY);
 
 		const MockERC20 = await ethers.getContractFactory("MockERC20");
 		usdc = await MockERC20.deploy();
@@ -63,8 +67,10 @@ describe("DividendVault behavior", function () {
 
 		// The vault snapshots the token on every deposit.
 		await token.setSnapshotter(await vault.getAddress(), true);
-		// Only vetted properties can host distributions.
-		await vault.setPropertyValid(await token.getAddress(), true);
+		// Only vetted properties can host distributions, and claims are gated
+		// by the product's ACE eligibility policy.
+		await vault.setPropertyValid(record.token, true);
+		await vault.setPropertyEligibilityPolicy(record.token, record.eligibilityPolicy);
 		await usdc.approve(await vault.getAddress(), DEPOSIT * 10n);
 
 		// 75/25 split between alice and bob.
@@ -140,14 +146,18 @@ describe("DividendVault behavior", function () {
 		);
 	});
 
-	it("blocks claims from unverified holders until re-verified", async function () {
+	it("blocks claims from ineligible holders until re-verified", async function () {
 		await vault.depositDividend(await token.getAddress(), DEPOSIT);
-		await registry.removeIdentity(bob.address);
+		await core.credentialRegistry
+			.connect(admin)
+			.removeCredential(ccidFor(bob.address), KYC(), "0x");
 		await expect(
 			vault.connect(bob).claim(await token.getAddress(), 0)
 		).to.be.revertedWith("Claimant not verified");
 
-		await registry.registerIdentity(bob.address, 840, KYC());
+		await core.credentialRegistry
+			.connect(admin)
+			.registerCredential(ccidFor(bob.address), KYC(), 0n, "0x", "0x");
 		await expect(
 			vault.connect(bob).claim(await token.getAddress(), 0)
 		).to.emit(vault, "DividendClaimed");
