@@ -13,7 +13,11 @@
 		"deploy:arc-testnet": "hardhat run --network arc-testnet scripts/deploy.ts",
 		"deploy:arbitrum-sepolia": "hardhat run --network arbitrum-sepolia scripts/deploy.ts",
 		"deploy:arbitrum-one": "hardhat run --network arbitrum-one scripts/deploy.ts",
-		"test:arc-testnet": "CI=true hardhat test test/TestnetValidation.ts --network arc-testnet"
+		"test:arc-testnet": "CI=true hardhat test test/TestnetValidation.ts --network arc-testnet",
+		"config-ace:validate": "hardhat run scripts/configure-ace.ts --network localhost",
+		"config-ace:plan": "ACE_CONFIG_COMMAND=plan hardhat run scripts/configure-ace.ts --network localhost",
+		"config-ace:apply": "ACE_CONFIG_COMMAND=apply hardhat run scripts/configure-ace.ts --network localhost",
+		"config-ace:verify": "ACE_CONFIG_COMMAND=verify hardhat run scripts/configure-ace.ts --network localhost"
 	},
 	"keywords": [
 		"real-estate",

@@ -1,0 +1,88 @@
+{
+	"schemaVersion": 1,
+	"network": {
+		"name": "ethereum-sepolia",
+		"chainId": 11155111
+	},
+	"coordinatorApi": {
+		"baseUrl": "https://ace.api.chain.link/v1",
+		"chainSelector": "16015286601757825753",
+		"policyEngineId": null,
+		"authorizationEnvironmentVariable": "ACE_API_KEY",
+		"tenantAuthenticationConfirmed": false
+	},
+	"inputs": {
+		"policyEngine": "0x0000000000000000000000000000000000000000",
+		"identityRegistry": "0x0000000000000000000000000000000000000000",
+		"credentialRegistry": "0x0000000000000000000000000000000000000000",
+		"writerPolicy": "0x0000000000000000000000000000000000000000",
+		"finalTargetBehavior": "allow"
+	},
+	"extractors": [
+		{
+			"id": "erc20-transfer",
+			"name": "ERC20TransferExtractor",
+			"signatures": [
+				"transfer(address,uint256)",
+				"transferFrom(address,address,uint256)"
+			],
+			"selector": "0xa9059cbb",
+			"address": "0x0000000000000000000000000000000000000000",
+			"outputs": [
+				{ "name": "from", "type": "address" },
+				{ "name": "to", "type": "address" },
+				{ "name": "amount", "type": "uint256" }
+			]
+		},
+		{
+			"id": "erc3643-mint-burn",
+			"name": "ERC3643MintBurnExtractor",
+			"signatures": [
+				"mint(address,uint256)"
+			],
+			"selector": "0x40c10f19",
+			"address": "0x0000000000000000000000000000000000000000",
+			"outputs": [
+				{ "name": "account", "type": "address" },
+				{ "name": "amount", "type": "uint256" }
+			]
+		}
+	],
+	"targets": [
+		{
+			"id": "identity-registry",
+			"validatorAddress": "inputs.identityRegistry",
+			"entrypoints": [
+				"registerIdentity(bytes32,address,bytes)",
+				"registerIdentities(bytes32[],address[],bytes)",
+				"removeIdentity(bytes32,address,bytes)"
+			],
+			"policyChain": [
+				{
+					"policyReference": "inputs.writerPolicy",
+					"parameters": []
+				}
+			]
+		},
+		{
+			"id": "credential-registry",
+			"validatorAddress": "inputs.credentialRegistry",
+			"entrypoints": [
+				"registerCredential(bytes32,bytes32,uint40,bytes,bytes)",
+				"registerCredentials(bytes32,bytes32[],uint40,bytes[],bytes)",
+				"renewCredential(bytes32,bytes32,uint40,bytes)",
+				"removeCredential(bytes32,bytes32,bytes)"
+			],
+			"policyChain": [
+				{
+					"policyReference": "inputs.writerPolicy",
+					"parameters": []
+				}
+			]
+		}
+	],
+	"notes": [
+		"Contract deployment stays onchain (scripts/deploy.ts); this manifest drives the ACE Coordinator API configuration only.",
+		"Product tokens and escrows are factory-created per product; their policy wiring is factory-owned onchain and is out of this manifest's scope."
+	]
+}

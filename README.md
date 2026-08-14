@@ -167,6 +167,27 @@ Compliance is not implemented in this repo anymore — it is the stock
 CCIP addresses (router, chain selector, RMN proxy, LINK, TokenAdminRegistry) are
 configured per network in [`networks.ts`](./networks.ts).
 
+### Control-plane configuration (ACE Coordinator API)
+
+Policy configuration is API-driven in production, not raw onchain calls:
+
+- **Deployment stays onchain** (`scripts/deploy.ts`): engine, registries,
+  extractor/policy instances, factory. The control plane records and manages
+  already-deployed resources.
+- **Configuration goes through the Coordinator API** (`https://ace.api.chain.link/v1`)
+  via `scripts/configure-ace.ts` (`validate | plan | apply | verify`,
+  dry-run-first, apply requires explicit confirmations). The desired state
+  lives in [`scripts/ace-configuration.json`](./scripts/ace-configuration.json):
+  engine extractor association, target registration (with per-target default
+  behavior), and policy protections. `verify` reconciles API state against
+  onchain readback (`getExtractor`, `getPolicies`).
+- **Identity/credential issuance** is the IDV partner's job (e.g. SumSub
+  creating CCIDs and attaching wallets through the authorized writer), not the
+  deployer EOA's.
+- Product tokens and escrows are factory-created per product; their policy
+  wiring is factory-owned onchain and intentionally outside the manifest's
+  scope (see the manifest `notes`).
+
 ## Deployment strategy — Arbitrum first, CRE before CCIP
 
 Arbitrum One is the target home chain for production; Arbitrum Sepolia is its
