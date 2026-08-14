@@ -1,0 +1,182 @@
+{
+	"schemaVersion": 2,
+	"network": {
+		"name": "ethereum-sepolia",
+		"chainId": 11155111
+	},
+	"coordinatorApi": {
+		"baseUrl": "https://ace.api.chain.link/v1",
+		"chainSelector": "16015286601757825753",
+		"authorizationEnvironmentVariable": "ACE_API_KEY",
+		"tenantAuthenticationConfirmed": false
+	},
+	"inputs": {
+		"deployer": "0x0000000000000000000000000000000000000000"
+	},
+	"extractors": [
+		{
+			"id": "erc20-transfer",
+			"name": "ERC20TransferExtractor",
+			"signatures": [
+				"transfer(address,uint256)",
+				"transferFrom(address,address,uint256)"
+			],
+			"selector": "0xa9059cbb",
+			"address": "0x0000000000000000000000000000000000000000",
+			"outputs": [
+				{ "name": "from", "type": "address" },
+				{ "name": "to", "type": "address" },
+				{ "name": "amount", "type": "uint256" }
+			]
+		},
+		{
+			"id": "erc3643-mint-burn",
+			"name": "ERC3643MintBurnExtractor",
+			"signatures": [
+				"mint(address,uint256)"
+			],
+			"selector": "0x40c10f19",
+			"address": "0x0000000000000000000000000000000000000000",
+			"outputs": [
+				{ "name": "account", "type": "address" },
+				{ "name": "amount", "type": "uint256" }
+			]
+		},
+		{
+			"id": "escrow-account",
+			"name": "AccountExtractor",
+			"signatures": [
+				"deposit(uint256)",
+				"depositFor(address,uint256)"
+			],
+			"selector": "0xb6b55f25",
+			"address": "0x0000000000000000000000000000000000000000",
+			"outputs": [
+				{ "name": "from", "type": "address" },
+				{ "name": "account", "type": "address" }
+			]
+		}
+	],
+	"policyImplementations": [
+		{
+			"id": "only-authorized-sender",
+			"name": "OnlyAuthorizedSenderPolicy",
+			"address": "0x0000000000000000000000000000000000000000",
+			"configSchema": {
+				"$comment": "TBD: replace with the platform schema from GET /policy-implementations/{id}",
+				"properties": {},
+				"policy_run_parameters": [],
+				"initial_configs": []
+			}
+		},
+		{
+			"id": "credential-registry-identity-validator",
+			"name": "CredentialRegistryIdentityValidatorPolicy",
+			"address": "0x0000000000000000000000000000000000000000",
+			"configSchema": {
+				"$comment": "TBD: replace with the platform schema from GET /policy-implementations/{id}",
+				"properties": {},
+				"policy_run_parameters": [],
+				"initial_configs": []
+			}
+		},
+		{
+			"id": "reject",
+			"name": "RejectPolicy",
+			"address": "0x0000000000000000000000000000000000000000",
+			"configSchema": {
+				"$comment": "TBD: replace with the platform schema from GET /policy-implementations/{id}",
+				"properties": {},
+				"policy_run_parameters": [],
+				"initial_configs": []
+			}
+		}
+	],
+	"engine": {
+		"name": "commertize-policy-engine",
+		"description": "Commertize securities stack policy engine (ACE API-managed)"
+	},
+	"registries": {
+		"identityRegistry": {
+			"name": "commertize-identity-registry",
+			"description": "Wallet -> CCID mappings (ACE API-managed)"
+		},
+		"credentialRegistry": {
+			"name": "commertize-credential-registry",
+			"description": "CCID -> credential records (ACE API-managed)"
+		}
+	},
+	"policies": [
+		{
+			"id": "writer",
+			"name": "commertize-registry-writer-policy",
+			"implementation": "only-authorized-sender",
+			"initialConfig": {}
+		},
+		{
+			"id": "reject-list",
+			"name": "commertize-reject-policy",
+			"implementation": "reject",
+			"initialConfig": {}
+		}
+	],
+	"targets": [
+		{
+			"id": "identity-registry",
+			"registry": "identityRegistry",
+			"entrypoints": [
+				"registerIdentity(bytes32,address,bytes)",
+				"registerIdentities(bytes32[],address[],bytes)",
+				"removeIdentity(bytes32,address,bytes)"
+			],
+			"policyChain": [
+				{
+					"policy": "writer",
+					"parameters": []
+				}
+			],
+			"desiredDefaultAllow": true
+		},
+		{
+			"id": "credential-registry",
+			"registry": "credentialRegistry",
+			"entrypoints": [
+				"registerCredential(bytes32,bytes32,uint40,bytes,bytes)",
+				"registerCredentials(bytes32,bytes32[],uint40,bytes[],bytes)",
+				"renewCredential(bytes32,bytes32,uint40,bytes)",
+				"removeCredential(bytes32,bytes32,bytes)"
+			],
+			"policyChain": [
+				{
+					"policy": "writer",
+					"parameters": []
+				}
+			],
+			"desiredDefaultAllow": true
+		}
+	],
+	"outputs": {
+		"extractors": {
+			"erc20-transfer": { "uuid": null, "address": "0x0000000000000000000000000000000000000000" },
+			"erc3643-mint-burn": { "uuid": null, "address": "0x0000000000000000000000000000000000000000" },
+			"escrow-account": { "uuid": null, "address": "0x0000000000000000000000000000000000000000" }
+		},
+		"engine": { "uuid": null, "address": "0x0000000000000000000000000000000000000000" },
+		"registries": {
+			"identityRegistry": { "uuid": null, "address": "0x0000000000000000000000000000000000000000" },
+			"credentialRegistry": { "uuid": null, "address": "0x0000000000000000000000000000000000000000" }
+		},
+		"policies": {
+			"writer": { "uuid": null, "address": "0x0000000000000000000000000000000000000000" },
+			"reject-list": { "uuid": null, "address": "0x0000000000000000000000000000000000000000" }
+		},
+		"factory": "0x0000000000000000000000000000000000000000",
+		"tokenImplementation": "0x0000000000000000000000000000000000000000"
+	},
+	"notes": [
+		"Own infra (extractors, policy implementations, factory, tokens) is deployed by scripts/deploy.ts and recorded here.",
+		"ACE-owned resources (PolicyEngine, registries, policy instances, targets, protections) are created by scripts/configure-ace.ts against the Coordinator API.",
+		"Policy parameter schemas (policyImplementations[*].configSchema) and initial configs come from the platform (GET /policy-implementations); fill them from the live API before apply.",
+		"Product tokens and escrows are factory-created per product; their per-product wiring is factory-owned onchain and is outside this manifest's scope."
+	]
+}

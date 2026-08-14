@@ -3,13 +3,16 @@ import hardhatToolboxMochaEthers from "@nomicfoundation/hardhat-toolbox-mocha-et
 
 // Monorepo: @commertize/utils loads the root .env stack. Standalone (public
 // repo / CI): the package is exported without workspace deps, so fall back to
-// plain dotenv on the package-local .env.
+// Node's native .env loader on the package-local .env.
 try {
 	const { loadEnv } = await import("@commertize/utils/server");
 	loadEnv();
 } catch {
-	const { config } = await import("dotenv");
-	config({ quiet: true });
+	try {
+		process.loadEnvFile();
+	} catch (error: any) {
+		if (error?.code !== "ENOENT") throw error;
+	}
 }
 
 import { NETWORKS, DEFAULT_NETWORK, getNetwork } from "./networks";

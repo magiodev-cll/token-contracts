@@ -6,14 +6,14 @@
 		"build": "hardhat build --no-typechain && tsup index.mts --format esm --dts --clean",
 		"compile": "hardhat build",
 		"test": "hardhat test",
-		"test:e2e": "bash scripts/e2e-local.sh",
-		"node": "hardhat node",
 		"clean": "hardhat clean",
-		"deploy:localhost": "hardhat run --network localhost scripts/deploy.ts",
-		"deploy:arc-testnet": "hardhat run --network arc-testnet scripts/deploy.ts",
-		"deploy:arbitrum-sepolia": "hardhat run --network arbitrum-sepolia scripts/deploy.ts",
-		"deploy:arbitrum-one": "hardhat run --network arbitrum-one scripts/deploy.ts",
-		"test:arc-testnet": "CI=true hardhat test test/TestnetValidation.ts --network arc-testnet"
+		"test:arc-testnet": "CI=true hardhat test test/TestnetValidation.ts --network arc-testnet",
+		"config-ace:validate": "hardhat run scripts/configure-ace.ts --network localhost",
+		"config-ace:plan": "ACE_CONFIG_COMMAND=plan hardhat run scripts/configure-ace.ts --network localhost",
+		"config-ace:apply": "ACE_CONFIG_COMMAND=apply hardhat run scripts/configure-ace.ts --network localhost",
+		"config-ace:verify": "ACE_CONFIG_COMMAND=verify hardhat run scripts/configure-ace.ts --network localhost",
+		"deploy:extractors": "DEPLOY_PHASE=extractors hardhat run scripts/deploy.ts",
+		"deploy:factory": "DEPLOY_PHASE=factory hardhat run scripts/deploy.ts"
 	},
 	"keywords": [
 		"real-estate",
@@ -61,19 +61,18 @@
 		"@nomicfoundation/ignition-core": "^3.1.0",
 		"@openzeppelin/contracts": "^5.6.1",
 		"chai": "^6.2.2",
-		"chalk": "^5.6.2",
+		"chalk": "^5.4.1",
 		"hardhat": "^3.2.0",
-		"mocha": "^11.7.5",
-		"prompts": "^2.4.2"
+		"mocha": "^11.7.5"
 	},
 	"dependencies": {
 		"@chainlink/ace": "1.2.0",
 		"@chainlink/contracts": "1.5.0",
 		"@chainlink/contracts-ccip": "1.6.4",
+		"@commertize/utils": "workspace:*",
 		"@openzeppelin/contracts-upgradeable": "^5.6.1",
 		"@openzeppelin/contracts@5.3.0": "npm:@openzeppelin/contracts@5.3.0",
-		"dotenv": "^17.3.1",
 		"ethers": "^6.16.0",
-		"@commertize/utils": "workspace:*"
+		"viem": "^2.55.16"
 	}
 }

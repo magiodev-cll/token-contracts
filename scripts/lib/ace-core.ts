@@ -8,6 +8,11 @@
 // │                                                                           │
 // │  PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. USE AT YOUR OWN RISK.    │
 // └───────────────────────────────────────────────────────────────────────────┘
+// Test-only harness. Production configuration is driven by the ACE Coordinator
+// API (scripts/configure-ace.ts + scripts/ace-configuration.json); this module
+// simulates the API's end state (engine + registries + policy wiring) so the
+// hardhat test suite can run against a local node. Hardhat deploys only the
+// own-infra contracts (scripts/deploy.ts).
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

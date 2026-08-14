@@ -27,14 +27,6 @@ jobs:
           sudo corepack enable
           node --version && pnpm --version
 
-      - name: Install Foundry (anvil)
-        env:
-          FOUNDRY_DIR: /home/runner/.foundry
-        run: |
-          curl -fsSL https://foundry.paradigm.xyz | bash
-          "$FOUNDRY_DIR/bin/foundryup"
-          echo "$FOUNDRY_DIR/bin" >> "$GITHUB_PATH"
-
       # @commertize/utils is a monorepo workspace dep used only by the runtime
       # export bundle (index.mts); contracts compile/test/deploy don't need it
       # and workspace: protocol cannot resolve in this standalone repo.
@@ -45,6 +37,10 @@ jobs:
 
       # TestnetValidation.ts self-skips via process.exit(0) and would end the
       # run early — list the unit suites explicitly (see README Development).
+      # The suites exercise the full stack (ACE core, product + escrow,
+      # compliance, dividends, CCIP identity sync) through the local-node
+      # harness; the former local-e2e script was removed with the move to
+      # API-driven ACE configuration (scripts/configure-ace.ts).
       - name: Unit tests
         run: >
           pnpm hardhat test
@@ -57,5 +53,5 @@ jobs:
           test/CCIPCompliantPool.ts
           test/PropertyNavOracle.ts
 
-      - name: Local E2E deployment validation
-        run: pnpm test:e2e
+      - name: Manifest validation (offline)
+        run: pnpm config-ace:validate
