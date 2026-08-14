@@ -222,6 +222,13 @@ per lane and warns when a token is not bridge-capable.
   exactly one active source chain (sequence spaces must not mix); registry
   updates and broadcasts are separate admin calls — pair them operationally so
   chains don't drift.
+- **Fail-closed wiring.** The policy engine runs allow-by-default — the
+  documented pattern: no stock policy except `BypassPolicy` returns `Allowed`,
+  so a reject-by-default engine would block even the issuer's own writes.
+  Fail-closed is therefore enforced by coverage: `deployAceCore` and the smoke
+  suite assert that every protected selector (token transfer/mint/admin
+  operations, registry writes, escrow deposits) has policies attached, and the
+  deployment refuses to proceed otherwise.
 - **Fault-tolerant distribution.** `ListingEscrow.finalize()` cannot be bricked
   by a single non-compliant investor: failed transfers park in `pendingTokens`
   for a later `claimTokens()` pull once the investor is verified again.

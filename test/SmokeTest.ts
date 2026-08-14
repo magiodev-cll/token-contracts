@@ -1,6 +1,16 @@
 import { expect } from "chai";
 import hre from "hardhat";
-import { deployAceCore, baseEligibilityConfig, onboard, ccidFor } from "./helpers/ace";
+import {
+	deployAceCore,
+	baseEligibilityConfig,
+	onboard,
+	ccidFor,
+	tokenSurface,
+	escrowSurface,
+	identityRegistrySurface,
+	credentialRegistrySurface,
+	assertPolicyCoverage,
+} from "./helpers/ace";
 
 const { ethers } = await hre.network.getOrCreate();
 
@@ -103,6 +113,15 @@ describe("Commertize ACE Contracts Suite", function () {
 
 		expect(escrow).to.not.equal(ethers.ZeroAddress);
 		expect(await core.factory.isEscrow(escrow)).to.equal(true);
+	});
+
+	it("Fail-closed: every protected selector has policies attached", async function () {
+		await assertPolicyCoverage(core.engine, [
+			...identityRegistrySurface.map((sig) => [core.identityRegistry.target, sig] as [string, string]),
+			...credentialRegistrySurface.map((sig) => [core.credentialRegistry.target, sig] as [string, string]),
+			...tokenSurface.map((sig) => [propertyToken.target, sig] as [string, string]),
+			...escrowSurface.map((sig) => [escrow, sig] as [string, string]),
+		]);
 	});
 
 	it("RejectPolicy blocks transfers to a sanctioned address", async function () {

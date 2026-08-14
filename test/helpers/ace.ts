@@ -24,5 +24,10 @@ export {
 	contractAt,
 	onboard,
 	baseEligibilityConfig,
+	tokenSurface,
+	escrowSurface,
+	identityRegistrySurface,
+	credentialRegistrySurface,
+	assertPolicyCoverage,
 } from "../../scripts/lib/ace-core";
 export type { AceCore, Credentials } from "../../scripts/lib/ace-core";

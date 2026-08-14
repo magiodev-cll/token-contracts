@@ -22,6 +22,59 @@ export const ACCREDITED = () => ethers.keccak256(ethers.toUtf8Bytes("common.accr
 
 export const sel = (sig: string) => ethers.id(sig).slice(0, 10);
 
+// Protected surface the factory wires policies for; used to fail closed if any
+// selector ships unwired. Self-burn (burn(uint256)) is deliberately unwired
+// (unrestricted, matches the old ComplianceEnabled model).
+export const tokenSurface = [
+	"transfer(address,uint256)",
+	"transferFrom(address,address,uint256)",
+	"mint(address,uint256)",
+	"burn(address,uint256)",
+	"pause()",
+	"unpause()",
+	"setName(string)",
+	"setSymbol(string)",
+	"forcedTransfer(address,address,uint256)",
+	"setAddressFrozen(address,bool)",
+	"freezePartialTokens(address,uint256)",
+	"unfreezePartialTokens(address,uint256)",
+];
+
+export const escrowSurface = ["deposit(uint256)", "depositFor(address,uint256)"];
+
+export const identityRegistrySurface = [
+	"registerIdentity(bytes32,address,bytes)",
+	"registerIdentities(bytes32[],address[],bytes)",
+	"removeIdentity(bytes32,address,bytes)",
+];
+export const credentialRegistrySurface = [
+	"registerCredential(bytes32,bytes32,uint40,bytes,bytes)",
+	"registerCredentials(bytes32,bytes32[],uint40,bytes[],bytes)",
+	"renewCredential(bytes32,bytes32,uint40,bytes)",
+	"removeCredential(bytes32,bytes32,bytes)",
+];
+
+/**
+ * Fail-closed coverage check: every (target, selector) must have at least one
+ * policy attached, else the deploy/test fails. The engine runs allow-by-default
+ * (no stock policy except BypassPolicy returns Allowed), so an unwired
+ * selector is a silent hole — this is the guard against it.
+ */
+export async function assertPolicyCoverage(
+	engine: any,
+	surface: [target: string, signature: string][]
+) {
+	const uncovered: string[] = [];
+	for (const [target, sig] of surface) {
+		if ((await engine.getPolicies(target, sel(sig))).length === 0) {
+			uncovered.push(`${sig} on ${target}`);
+		}
+	}
+	if (uncovered.length > 0) {
+		throw new Error(`Unprotected selectors: ${uncovered.join(", ")}`);
+	}
+}
+
 // Hardhat 3 emits artifacts only for the project's own sources; @chainlink/ace
 // contracts (compiled as npm dependencies) are reachable through the build-info
 // output instead. Read ABIs + bytecode from there so deploy tooling can deploy
@@ -139,17 +192,15 @@ export async function deployAceCore(admin: any): Promise<AceCore> {
 
 	const emptyParams: string[] = [];
 	const registryWrites: [string, string][] = [
-		[identityRegistry.target, "registerIdentity(bytes32,address,bytes)"],
-		[identityRegistry.target, "registerIdentities(bytes32[],address[],bytes)"],
-		[identityRegistry.target, "removeIdentity(bytes32,address,bytes)"],
-		[credentialRegistry.target, "registerCredential(bytes32,bytes32,uint40,bytes,bytes)"],
-		[credentialRegistry.target, "registerCredentials(bytes32,bytes32[],uint40,bytes[],bytes)"],
-		[credentialRegistry.target, "renewCredential(bytes32,bytes32,uint40,bytes)"],
-		[credentialRegistry.target, "removeCredential(bytes32,bytes32,bytes)"],
+		...identityRegistrySurface.map((sig) => [identityRegistry.target, sig] as [string, string]),
+		...credentialRegistrySurface.map((sig) => [credentialRegistry.target, sig] as [string, string]),
 	];
 	for (const [target, sig] of registryWrites) {
 		await engine.addPolicy(target, sel(sig), writerPolicy.target, emptyParams);
 	}
+	// Fail closed: the deployment refuses to proceed if any protected
+	// selector ships without policies.
+	await assertPolicyCoverage(engine, registryWrites);
 
 	// Sanctions screening: stock RejectPolicy (denylist managed by its owner,
 	// the admin in this PoC — a sanctions provider would hold ownership).
