@@ -61,18 +61,18 @@
 		"@nomicfoundation/ignition-core": "^3.1.0",
 		"@openzeppelin/contracts": "^5.6.1",
 		"chai": "^6.2.2",
+		"chalk": "^5.4.1",
 		"hardhat": "^3.2.0",
-		"mocha": "^11.7.5",
-		"chalk": "^5.4.1"
+		"mocha": "^11.7.5"
 	},
 	"dependencies": {
 		"@chainlink/ace": "1.2.0",
 		"@chainlink/contracts": "1.5.0",
 		"@chainlink/contracts-ccip": "1.6.4",
+		"@commertize/utils": "workspace:*",
 		"@openzeppelin/contracts-upgradeable": "^5.6.1",
 		"@openzeppelin/contracts@5.3.0": "npm:@openzeppelin/contracts@5.3.0",
-		"dotenv": "^17.3.1",
 		"ethers": "^6.16.0",
-		"@commertize/utils": "workspace:*"
+		"viem": "^2.55.16"
 	}
 }

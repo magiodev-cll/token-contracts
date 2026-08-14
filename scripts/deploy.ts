@@ -22,17 +22,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import hre from "hardhat";
+import { zeroAddress } from "viem";
 import { aceFactory } from "./lib/ace-core";
-import { invariant } from "./lib/ace-api";
-
-const ZERO = `0x${"0".repeat(40)}`;
+import { invariant, readJson } from "./lib/ace-api";
 
 const phase = process.env.DEPLOY_PHASE ?? "";
 invariant(["extractors", "factory"].includes(phase), "DEPLOY_PHASE must be 'extractors' or 'factory'");
 
 const { ethers } = await hre.network.getOrCreate();
 const manifestFile = path.join(import.meta.dirname, "ace-configuration.json");
-const manifest: any = JSON.parse(await fs.promises.readFile(manifestFile, "utf8"));
+const manifest: any = await readJson(manifestFile);
 
 async function writeManifest() {
 	await fs.promises.writeFile(manifestFile, JSON.stringify(manifest, null, "\t") + "\n");
@@ -92,14 +91,14 @@ if (phase === "extractors") {
 }
 
 // Phase: factory — requires the API-created engine and RejectPolicy instance
-const engineAddress = manifest.outputs?.engine?.address ?? ZERO;
-const rejectPolicyAddress = manifest.outputs?.policies?.["reject-list"]?.address ?? ZERO;
-invariant(engineAddress !== ZERO, "outputs.engine.address is empty — run configure-ace apply first (the API deploys the PolicyEngine)");
-invariant(rejectPolicyAddress !== ZERO, "outputs.policies['reject-list'].address is empty — run configure-ace apply first");
+const engineAddress = manifest.outputs?.engine?.address ?? zeroAddress;
+const rejectPolicyAddress = manifest.outputs?.policies?.["reject-list"]?.address ?? zeroAddress;
+invariant(engineAddress !== zeroAddress, "outputs.engine.address is empty — run configure-ace apply first (the API deploys the PolicyEngine)");
+invariant(rejectPolicyAddress !== zeroAddress, "outputs.policies['reject-list'].address is empty — run configure-ace apply first");
 const eligibilityImpl = manifest.policyImplementations.find((item: any) => item.id === "credential-registry-identity-validator");
 const senderImpl = manifest.policyImplementations.find((item: any) => item.id === "only-authorized-sender");
-invariant(eligibilityImpl?.address && eligibilityImpl.address !== ZERO, "eligibility implementation not deployed (run DEPLOY_PHASE=extractors first)");
-invariant(senderImpl?.address && senderImpl.address !== ZERO, "sender policy implementation not deployed (run DEPLOY_PHASE=extractors first)");
+invariant(eligibilityImpl?.address && eligibilityImpl.address !== zeroAddress, "eligibility implementation not deployed (run DEPLOY_PHASE=extractors first)");
+invariant(senderImpl?.address && senderImpl.address !== zeroAddress, "sender policy implementation not deployed (run DEPLOY_PHASE=extractors first)");
 
 const tokenImplementation = await (await ethers.getContractFactory("PropertyToken")).deploy();
 await tokenImplementation.waitForDeployment();

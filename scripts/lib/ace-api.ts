@@ -14,44 +14,17 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import assert from "node:assert";
+
+export const invariant = assert;
+import { isAddress } from "viem";
 
 export const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-export const REPO_DIR = path.resolve(SCRIPT_DIR, "..", "..");
 export const DEFAULT_MANIFEST = path.join(SCRIPT_DIR, "..", "ace-configuration.json");
 export const COORDINATOR_API_URL = "https://ace.api.chain.link/v1";
 
-export function invariant(condition: unknown, message: string): asserts condition {
-	if (!condition) throw new Error(message);
-}
-
-export function isAddress(value: unknown): value is string {
-	return typeof value === "string" && /^0x[0-9a-fA-F]{40}$/.test(value);
-}
-
 export async function readJson(file: string) {
 	return JSON.parse(await fs.promises.readFile(file, "utf8"));
-}
-
-export async function loadDotEnv(file = path.join(REPO_DIR, ".env")) {
-	let source: string;
-	try {
-		source = await fs.promises.readFile(file, "utf8");
-	} catch (error: any) {
-		if (error?.code === "ENOENT") return;
-		throw error;
-	}
-	for (const [index, rawLine] of source.split(/\r?\n/).entries()) {
-		const line = rawLine.trim();
-		if (!line || line.startsWith("#")) continue;
-		const separator = line.indexOf("=");
-		invariant(separator > 0, `Invalid .env syntax on line ${index + 1}`);
-		const key = line.slice(0, separator).trim();
-		let value = line.slice(separator + 1).trim();
-		if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-			value = value.slice(1, -1);
-		}
-		if (!(key in process.env)) process.env[key] = value;
-	}
 }
 
 function safeApiError(method: string, url: URL, response: Response, payload: any) {
@@ -145,13 +118,6 @@ export async function verifyApiNetwork(api: AceApi, chainSelector: string, chain
 	return network;
 }
 
-export function statusOf(onchain: unknown[] | undefined, chainSelector: string) {
-	const record = (onchain ?? []).find(
-		(item: any) => String(item.chain_selector) === String(chainSelector)
-	);
-	return record?.status ?? "missing";
-}
-
 /** Polls a resource until every requested onchain sub-resource reports "created". */
 export async function waitForStatus(
 	api: AceApi,
@@ -163,7 +129,12 @@ export async function waitForStatus(
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
 		const resource = await api.get(pathname, { query: { include_onchains: true } });
-		const statuses = fields.map((field) => statusOf(resource[field], chainSelector));
+		const statuses = fields.map((field) => {
+			const record = ((resource[field] as any[] | undefined) ?? []).find(
+				(item: any) => String(item.chain_selector) === String(chainSelector)
+			);
+			return record?.status ?? "missing";
+		});
 		if (statuses.every((status) => status === "created")) return resource;
 		if (statuses.some((status) => status === "creation_failed" || status === "failed")) {
 			throw new Error(`${pathname}: creation failed on ${chainSelector}`);

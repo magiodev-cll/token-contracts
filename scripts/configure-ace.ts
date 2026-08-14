@@ -25,20 +25,17 @@
 //   pnpm config-ace:verify -- --network sepolia
 import fs from "node:fs";
 import path from "node:path";
+import { isAddress, zeroAddress } from "viem";
 import {
 	AceApi,
 	DEFAULT_MANIFEST,
 	invariant,
-	isAddress,
-	loadDotEnv,
 	readJson,
-	statusOf,
 	verifyApiNetwork,
 	waitForStatus,
 } from "./lib/ace-api";
 import { contractAt, sel } from "./lib/ace-core";
 
-const ZERO = `0x${"0".repeat(40)}`;
 const command = process.env.ACE_CONFIG_COMMAND ?? "validate";
 invariant(["validate", "plan", "apply", "verify"].includes(command), `Unknown ACE_CONFIG_COMMAND: ${command}`);
 const flags = {
@@ -51,7 +48,7 @@ const CHAIN = String(manifest.coordinatorApi.chainSelector);
 
 function resolvedAddress(reference: string) {
 	const value = reference.split(".").reduce((node: any, key: string) => node?.[key], manifest);
-	invariant(isAddress(value) && value !== ZERO, `${reference} is not filled in the manifest`);
+	invariant(isAddress(value) && value !== zeroAddress, `${reference} is not filled in the manifest`);
 	return value;
 }
 
@@ -384,9 +381,9 @@ function writeBack() {
 
 function readbackState() {
 	const output = manifest.outputs;
-	invariant(output.engine?.address && output.engine.address !== ZERO, "outputs.engine.address is empty (run apply first)");
+	invariant(output.engine?.address && output.engine.address !== zeroAddress, "outputs.engine.address is empty (run apply first)");
 	invariant(
-		output.registries.identityRegistry?.address !== ZERO && output.registries.credentialRegistry?.address !== ZERO,
+		output.registries.identityRegistry?.address !== zeroAddress && output.registries.credentialRegistry?.address !== zeroAddress,
 		"registry addresses are empty (run apply first)"
 	);
 	return {
@@ -400,7 +397,11 @@ function readbackState() {
 validateManifest();
 if (command === "validate") process.exit(0);
 
-await loadDotEnv();
+try {
+	process.loadEnvFile(path.join(import.meta.dirname, "..", ".env"));
+} catch (error: any) {
+	if (error?.code !== "ENOENT") throw error;
+}
 const apiKeyName = manifest.coordinatorApi.authorizationEnvironmentVariable ?? "ACE_API_KEY";
 const api = new AceApi(manifest.coordinatorApi.baseUrl, process.env[apiKeyName]);
 if (command === "apply") {
